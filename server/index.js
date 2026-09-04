@@ -205,17 +205,30 @@ function publicRateLimit(limit, fallbackId) {
   };
 }
 
+function publicResetCredit(credit) {
+  return {
+    id: String(credit.id),
+    title: credit.title == null ? null : String(credit.title),
+    description: credit.description == null ? null : String(credit.description),
+    expiresAt: credit.expiresAt == null ? null : Number(credit.expiresAt),
+  };
+}
+
 function publicRateLimits(result) {
   const snapshot = result.snapshot || {};
   const byId = snapshot.rateLimitsByLimitId;
+  const resetCreditSummary = snapshot.rateLimitResetCredits;
   const entries = byId && Object.keys(byId).length
     ? Object.entries(byId)
     : snapshot.rateLimits ? [[snapshot.rateLimits.limitId || 'codex', snapshot.rateLimits]] : [];
   return {
     limits: entries.filter(([, limit]) => limit).map(([id, limit]) => publicRateLimit(limit, id)),
-    resetCreditsCount: snapshot.rateLimitResetCredits?.availableCount == null
+    resetCreditsCount: resetCreditSummary?.availableCount == null
       ? null
-      : Number(snapshot.rateLimitResetCredits.availableCount),
+      : Number(resetCreditSummary.availableCount),
+    resetCredits: resetCreditSummary?.credits == null
+      ? null
+      : resetCreditSummary.credits.map(publicResetCredit),
     fetchedAt: result.fetchedAt,
     nextRefreshAt: result.nextRefreshAt,
     refreshAllowedAt: result.refreshAllowedAt,

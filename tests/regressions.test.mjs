@@ -223,16 +223,25 @@ test('the quota module is reachable from desktop and mobile navigation without p
   assert.match(limits, /orderedLimits\.map\(\(limit\) =>/);
   assert.match(limits, /mainworker:account-limits/);
   assert.match(limits, /window\.localStorage\.setItem/);
+  assert.match(limits, /hasOwnProperty\.call\(payload, 'resetCredits'\)/);
   assert.match(limits, /showingStaleWhileRefreshing/);
   assert.match(limits, /正在刷新额度/);
   assert.match(limits, /可用重置次数/);
   assert.match(limits, /payload\.resetCreditsCount != null \? \(/);
   assert.match(limits, /<strong>\{payload\.resetCreditsCount\} 次<\/strong>/);
+  assert.match(limits, /resetCredits\.map\(\(credit, index\) =>/);
+  assert.match(limits, /expiryDateTime\(credit\.expiresAt\)/);
+  assert.match(limits, /if \(value == null\) return '到期时间未知';/);
+  assert.doesNotMatch(limits, /长期有效/);
+  assert.match(limits, /另有 \{missingResetCreditDetails\} 次未返回到期明细/);
   assert.doesNotMatch(limits, /当前账户未提供/);
   assert.doesNotMatch(limits, /数据状态<strong>/);
   assert.doesNotMatch(limits, /查询策略<strong>/);
   assert.doesNotMatch(limits, /className="limits-policy"/);
-  assert.match(server, /rateLimitResetCredits\?\.availableCount/);
+  assert.match(server, /resetCreditSummary\?\.availableCount/);
+  assert.match(server, /resetCreditSummary\?\.credits == null/);
+  assert.match(server, /resetCreditSummary\.credits\.map\(publicResetCredit\)/);
+  assert.match(server, /expiresAt: credit\.expiresAt == null \? null : Number\(credit\.expiresAt\)/);
   assert.match(server, /request\.method === 'POST'.*\/api\/account\/limits\/refresh/);
 });
 

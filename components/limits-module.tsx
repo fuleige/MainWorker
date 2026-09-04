@@ -25,9 +25,17 @@ type AccountLimit = {
   reachedType: string | null;
 };
 
+type ResetCredit = {
+  id: string;
+  title: string | null;
+  description: string | null;
+  expiresAt: number | null;
+};
+
 type LimitsPayload = {
   limits: AccountLimit[];
   resetCreditsCount: number | null;
+  resetCredits: ResetCredit[] | null;
   fetchedAt: string;
   nextRefreshAt: string;
   refreshAllowedAt: string;
@@ -64,7 +72,8 @@ function writeStoredLimits(payload: LimitsPayload) {
 }
 
 function isClientCacheFresh(payload: LimitsPayload) {
-  return Date.now() < new Date(payload.nextRefreshAt).getTime();
+  const hasResetCreditDetails = Object.prototype.hasOwnProperty.call(payload, 'resetCredits');
+  return hasResetCreditDetails && Date.now() < new Date(payload.nextRefreshAt).getTime();
 }
 
 function readLimits(force = false) {
@@ -111,6 +120,21 @@ function dateTime(value: string | number | null) {
   const date = typeof value === 'number' ? new Date(value * 1000) : new Date(value);
   if (Number.isNaN(date.getTime())) return '未知';
   return new Intl.DateTimeFormat('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(date);
+}
+
+function expiryDateTime(value: number | null) {
+  if (value == null) return '到期时间未知';
+  const date = new Date(value * 1000);
+  if (Number.isNaN(date.getTime())) return '到期时间未知';
+  return `${new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit',
+  }).format(date)} 到期`;
+}
+
+function expiryDateTimeAttribute(value: number | null) {
+  if (value == null) return undefined;
+  const date = new Date(value * 1000);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
 }
 
 function untilReset(timestamp: number | null) {
@@ -202,6 +226,10 @@ export function LimitsModule({ onUnauthorized }: { onUnauthorized: () => void })
   const cacheExpired = payload ? now >= new Date(payload.nextRefreshAt).getTime() : false;
   const showingStaleWhileRefreshing = Boolean(payload && loading && (cacheExpired || payload.stale));
   const orderedLimits = payload ? [...payload.limits].sort(compareLimits) : [];
+  const resetCredits = payload?.resetCredits ?? null;
+  const missingResetCreditDetails = payload?.resetCreditsCount == null
+    ? 0
+    : Math.max(0, payload.resetCreditsCount - (resetCredits?.length ?? 0));
 
   async function refresh() {
     if (refreshing || refreshWaitMs > 0) return;
@@ -246,9 +274,27 @@ export function LimitsModule({ onUnauthorized }: { onUnauthorized: () => void })
           <div className="limits-summary">
             <div><span className="limits-summary-icon warm"><Clock3 /></span><p>上次更新<strong>{dateTime(payload.fetchedAt)}</strong></p></div>
             {payload.resetCreditsCount != null ? (
-              <div title="当前账户可用于恢复 Codex 额度窗口的重置权益数量">
+              <div className="reset-credit-summary" title="当前账户可用于恢复 Codex 额度窗口的重置权益">
                 <span className="limits-summary-icon credit"><RefreshCw /></span>
-                <p>可用重置次数<strong>{payload.resetCreditsCount} 次</strong></p>
+                <div className="reset-credit-content">
+                  <p>可用重置次数<strong>{payload.resetCreditsCount} 次</strong></p>
+                  {resetCredits?.length ? (
+                    <ul className="reset-credit-list" aria-label="重置机会到期时间">
+                      {resetCredits.map((credit, index) => (
+                        <li key={credit.id || `${credit.expiresAt}-${index}`} title={credit.description || credit.title || undefined}>
+                          <span>{credit.title || `重置机会 ${index + 1}`}</span>
+                          <time dateTime={expiryDateTimeAttribute(credit.expiresAt)}>{expiryDateTime(credit.expiresAt)}</time>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                  {payload.resetCreditsCount > 0 && resetCredits == null ? (
+                    <small className="reset-credit-note">服务未返回到期明细</small>
+                  ) : null}
+                  {missingResetCreditDetails > 0 && resetCredits != null ? (
+                    <small className="reset-credit-note">另有 {missingResetCreditDetails} 次未返回到期明细</small>
+                  ) : null}
+                </div>
               </div>
             ) : null}
           </div>
