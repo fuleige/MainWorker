@@ -3,16 +3,36 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError, chatQuery, parseSse } from '@/lib/workbench-api';
 
+export type ChatMode = 'work' | 'quick';
+
 export type ChatSession = {
   id: number;
   scope: string;
   contextKey: string;
   threadId: string | null;
   title: string;
+  mode: ChatMode;
+  model: string | null;
+  reasoningEffort: string | null;
   createdAt: string;
   updatedAt: string;
   turnCount: number;
   running: boolean;
+};
+
+export type ChatModel = {
+  id: string;
+  name: string;
+  description: string;
+  isDefault: boolean;
+  defaultReasoningEffort: string;
+  reasoningEfforts: Array<{ id: string; description: string }>;
+};
+
+type ChatModelCatalog = {
+  models: ChatModel[];
+  defaultModel: string;
+  defaultReasoningEffort: string;
 };
 
 export type ChatMessage = {
@@ -57,6 +77,13 @@ export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauth
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [currentSession, setCurrentSession] = useState<ChatSession | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [models, setModels] = useState<ChatModel[]>([]);
+  const [defaultModel, setDefaultModel] = useState('');
+  const [defaultReasoningEffort, setDefaultReasoningEffort] = useState('');
+  const [draftMode, setDraftMode] = useState<ChatMode>('work');
+  const [draftModel, setDraftModel] = useState('');
+  const [draftReasoningEffort, setDraftReasoningEffort] = useState('');
+  const [settingsSaving, setSettingsSaving] = useState(false);
   const [loading, setLoading] = useState(enabled);
   const [sending, setSending] = useState(false);
   const [activity, setActivity] = useState('就绪');
@@ -65,10 +92,29 @@ export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauth
   const activeRef = useRef<ActiveRun | null>(null);
   const controllerRef = useRef<AbortController | null>(null);
   const scopeRef = useRef({ scope, articlePath, sourceId });
+  const draftModeRef = useRef<ChatMode>('work');
 
   useEffect(() => {
     scopeRef.current = { scope, articlePath, sourceId };
   }, [articlePath, scope, sourceId]);
+
+  useEffect(() => {
+    if (!enabled || scope !== 'workspace') return;
+    void api<ChatModelCatalog>('/api/chat/models')
+      .then((payload) => {
+        setModels(payload.models);
+        setDefaultModel(payload.defaultModel);
+        setDefaultReasoningEffort(payload.defaultReasoningEffort);
+        const model = payload.models.find((item) => item.id === payload.defaultModel) || payload.models[0];
+        setDraftModel(model?.id || '');
+        setDraftReasoningEffort(
+          draftModeRef.current === 'quick' && model?.reasoningEfforts.some((effort) => effort.id === 'low')
+            ? 'low'
+            : payload.defaultReasoningEffort || model?.defaultReasoningEffort || '',
+        );
+      })
+      .catch(() => setModels([]));
+  }, [enabled, scope]);
 
   const handleError = useCallback((caught: unknown) => {
     const problem = caught instanceof Error ? caught : new Error('请求失败');
@@ -207,7 +253,7 @@ export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauth
     const context = scopeRef.current;
     const params = chatQuery(context.scope, context.articlePath, context.sourceId);
     let payload = await api<{ sessions: ChatSession[] }>(`/api/chat/sessions?${params}`);
-    if (!payload.sessions.length) {
+    if (!payload.sessions.length && context.scope !== 'workspace') {
       const created = await api<{ session: ChatSession }>('/api/chat/sessions', {
         method: 'POST',
         body: JSON.stringify({ scope: context.scope, articlePath: context.articlePath, sourceId: context.sourceId }),
@@ -215,11 +261,21 @@ export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauth
       payload = { sessions: [created.session] };
     }
     setSessions(payload.sessions);
+    if (context.scope === 'workspace' && preferredId === undefined) {
+      setCurrentSession(null);
+      setMessages([]);
+      return;
+    }
     const storageKey = `mainworker:session:${context.scope}:${context.sourceId || ''}:${context.articlePath || ''}`;
     const savedId = Number(localStorage.getItem(storageKey));
     const selected = payload.sessions.find((item) => item.id === preferredId)
       || payload.sessions.find((item) => item.id === savedId)
       || payload.sessions[0];
+    if (!selected) {
+      setCurrentSession(null);
+      setMessages([]);
+      return;
+    }
     setCurrentSession(selected);
     localStorage.setItem(storageKey, String(selected.id));
     await loadHistory(selected);
@@ -244,18 +300,37 @@ export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauth
     try { await loadHistory(session); } catch (caught) { handleError(caught); } finally { setLoading(false); }
   }, [handleError, loadHistory]);
 
-  const createSession = useCallback(async () => {
+  const startNewSession = useCallback(async (mode: ChatMode = 'work') => {
+    const context = scopeRef.current;
+    if (context.scope === 'workspace') {
+      controllerRef.current?.abort();
+      activeRef.current = null;
+      draftModeRef.current = mode;
+      setDraftMode(mode);
+      const model = models.find((item) => item.id === defaultModel) || models[0];
+      setDraftModel(model?.id || defaultModel);
+      setDraftReasoningEffort(
+        mode === 'quick' && model?.reasoningEfforts.some((effort) => effort.id === 'low')
+          ? 'low'
+          : defaultReasoningEffort || model?.defaultReasoningEffort || '',
+      );
+      setCurrentSession(null);
+      setMessages([]);
+      setSending(false);
+      setActivity('就绪');
+      setError('');
+      return;
+    }
     try {
-      const context = scopeRef.current;
       const payload = await api<{ session: ChatSession }>('/api/chat/sessions', {
-        method: 'POST', body: JSON.stringify({ scope: context.scope, articlePath: context.articlePath, sourceId: context.sourceId }),
+        method: 'POST', body: JSON.stringify({ scope: context.scope, articlePath: context.articlePath, sourceId: context.sourceId, mode }),
       });
       setSessions((items) => [payload.session, ...items]);
       await selectSession(payload.session);
     } catch (caught) {
       handleError(caught);
     }
-  }, [handleError, selectSession]);
+  }, [defaultModel, defaultReasoningEffort, handleError, models, selectSession]);
 
   const deleteSession = useCallback(async (target?: ChatSession) => {
     const session = target || currentSession;
@@ -274,8 +349,40 @@ export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauth
     }
   }, [currentSession, handleError, refreshSessions]);
 
+  const updateSessionSettings = useCallback(async (model: string | null, reasoningEffort: string | null) => {
+    if (settingsSaving) return;
+    if (!currentSession) {
+      setDraftModel(model || '');
+      setDraftReasoningEffort(reasoningEffort || '');
+      return;
+    }
+    if (currentSession.running) return;
+    setSettingsSaving(true);
+    setError('');
+    try {
+      const context = scopeRef.current;
+      const payload = await api<{ session: ChatSession }>('/api/chat/sessions', {
+        method: 'PATCH',
+        body: JSON.stringify({
+          scope: context.scope,
+          articlePath: context.articlePath,
+          sourceId: context.sourceId,
+          sessionId: currentSession.id,
+          model,
+          reasoningEffort,
+        }),
+      });
+      setCurrentSession(payload.session);
+      setSessions((items) => items.map((item) => item.id === payload.session.id ? payload.session : item));
+    } catch (caught) {
+      handleError(caught);
+    } finally {
+      setSettingsSaving(false);
+    }
+  }, [currentSession, handleError, settingsSaving]);
+
   const send = useCallback(async (text: string) => {
-    if (!currentSession || sending || !text.trim()) return;
+    if (sending || !text.trim()) return;
     const temporary = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const userId = `user-${temporary}`;
     const assistantId = `assistant-${temporary}`;
@@ -285,18 +392,37 @@ export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauth
     setError('');
     const context = scopeRef.current;
     try {
+      let session = currentSession;
+      if (!session) {
+        const created = await api<{ session: ChatSession }>('/api/chat/sessions', {
+          method: 'POST',
+          body: JSON.stringify({
+            scope: context.scope,
+            articlePath: context.articlePath,
+            sourceId: context.sourceId,
+            mode: draftMode,
+            model: draftModel,
+            reasoningEffort: draftReasoningEffort,
+          }),
+        });
+        const createdSession = created.session;
+        session = createdSession;
+        setCurrentSession(createdSession);
+        setSessions((items) => [createdSession, ...items]);
+        localStorage.setItem(`mainworker:session:${context.scope}:${context.sourceId || ''}:${context.articlePath || ''}`, String(createdSession.id));
+      }
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ scope: context.scope, articlePath: context.articlePath, sourceId: context.sourceId, sessionId: currentSession.id, message: text.trim() }),
+        body: JSON.stringify({ scope: context.scope, articlePath: context.articlePath, sourceId: context.sourceId, sessionId: session.id, message: text.trim() }),
       });
-      await follow(response, assistantId, currentSession.id);
-      await refreshSessions(currentSession.id);
+      await follow(response, assistantId, session.id);
+      await refreshSessions(session.id);
     } catch (caught) {
       handleError(caught);
       setAssistant(assistantId, (message) => ({ ...message, text: message.text || (caught as Error).message, status: 'failed' }));
     }
-  }, [currentSession, follow, handleError, refreshSessions, sending, setAssistant]);
+  }, [currentSession, draftMode, draftModel, draftReasoningEffort, follow, handleError, refreshSessions, sending, setAssistant]);
 
   const interrupt = useCallback(async () => {
     if (!activeRef.current) return;
@@ -308,5 +434,13 @@ export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauth
     }
   }, [handleError]);
 
-  return { sessions, currentSession, messages, loading, sending, activity, error, selectSession, createSession, deleteSession, send, interrupt, refreshSessions };
+  const currentMode = currentSession?.mode || draftMode;
+  const currentModel = currentSession?.model || draftModel;
+  const currentReasoningEffort = currentSession?.reasoningEffort || draftReasoningEffort;
+
+  return {
+    sessions, currentSession, currentMode, currentModel, currentReasoningEffort,
+    messages, models, loading, sending, settingsSaving, activity, error,
+    selectSession, startNewSession, deleteSession, updateSessionSettings, send, interrupt, refreshSessions,
+  };
 }

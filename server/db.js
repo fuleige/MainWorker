@@ -23,6 +23,9 @@ export class WorkbenchDatabase {
         scope TEXT NOT NULL,
         context_key TEXT NOT NULL,
         thread_id TEXT UNIQUE,
+        mode TEXT NOT NULL DEFAULT 'work' CHECK(mode IN ('work','quick')),
+        model TEXT,
+        reasoning_effort TEXT,
         title TEXT NOT NULL DEFAULT '新会话',
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -84,6 +87,16 @@ export class WorkbenchDatabase {
       CREATE INDEX IF NOT EXISTS idx_planner_tasks_status_due
         ON planner_tasks(status, due_date, id);
     `);
+    const sessionColumns = this.database.prepare('PRAGMA table_info(chat_sessions)').all();
+    if (!sessionColumns.some((column) => column.name === 'mode')) {
+      this.database.exec("ALTER TABLE chat_sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'work' CHECK(mode IN ('work','quick'))");
+    }
+    if (!sessionColumns.some((column) => column.name === 'model')) {
+      this.database.exec('ALTER TABLE chat_sessions ADD COLUMN model TEXT');
+    }
+    if (!sessionColumns.some((column) => column.name === 'reasoning_effort')) {
+      this.database.exec('ALTER TABLE chat_sessions ADD COLUMN reasoning_effort TEXT');
+    }
     const plannerColumns = this.database.prepare('PRAGMA table_info(planner_tasks)').all();
     if (!plannerColumns.some((column) => column.name === 'parent_id')) {
       this.database.exec('ALTER TABLE planner_tasks ADD COLUMN parent_id INTEGER REFERENCES planner_tasks(id) ON DELETE CASCADE');
@@ -102,8 +115,8 @@ export class WorkbenchDatabase {
     }
   }
 
-  createSession(scope, contextKey) {
-    const result = this.database.prepare('INSERT INTO chat_sessions(scope, context_key) VALUES (?, ?)').run(scope, contextKey);
+  createSession(scope, contextKey, mode = 'work', model = null, reasoningEffort = null) {
+    const result = this.database.prepare('INSERT INTO chat_sessions(scope, context_key, mode, model, reasoning_effort) VALUES (?, ?, ?, ?, ?)').run(scope, contextKey, mode, model, reasoningEffort);
     return this.getSession(scope, contextKey, Number(result.lastInsertRowid));
   }
 
@@ -130,6 +143,10 @@ export class WorkbenchDatabase {
 
   touchSession(id) {
     this.database.prepare('UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(id);
+  }
+
+  updateSessionSettings(id, model, reasoningEffort) {
+    this.database.prepare('UPDATE chat_sessions SET model = ?, reasoning_effort = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(model, reasoningEffort, id);
   }
 
   nameNewSession(id, text) {

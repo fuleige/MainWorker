@@ -1,7 +1,7 @@
 'use client';
 
 import { SyntheticEvent, useCallback, useEffect, useState } from 'react';
-import { BookOpenText, CalendarDays, Gauge, LogOut, MessageSquareText, Settings2, ShieldCheck } from 'lucide-react';
+import { BookOpenText, CalendarDays, Gauge, LogOut, MessageSquareText, PanelLeftClose, PanelLeftOpen, Settings2, ShieldCheck } from 'lucide-react';
 import { ArticlesModule } from '@/components/articles-module';
 import { ChatWorkspace } from '@/components/chat-workspace';
 import { LimitsModule } from '@/components/limits-module';
@@ -26,14 +26,15 @@ export function WorkbenchApp() {
   const [loginBusy, setLoginBusy] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [module, setModule] = useState<ModuleId>('chat');
+  const [railCollapsed, setRailCollapsed] = useState(false);
   const requireLogin = useCallback(() => setAuthenticated(false), []);
 
   useEffect(() => {
     const requested = new URLSearchParams(location.search).get('module');
-    const saved = localStorage.getItem('mainworker:module');
+    queueMicrotask(() => setRailCollapsed(localStorage.getItem('mainworker:rail-collapsed') === '1'));
     const initialModule = requested === 'articles' || requested === 'planner' || requested === 'chat' || requested === 'limits'
       ? requested
-      : saved === 'articles' || saved === 'planner' || saved === 'chat' || saved === 'limits' ? saved : 'chat';
+      : 'chat';
     queueMicrotask(() => setModule(initialModule));
     fetch('/api/session/status')
       .then((response) => response.json() as Promise<{ authenticated?: boolean }>)
@@ -43,7 +44,6 @@ export function WorkbenchApp() {
 
   function changeModule(next: ModuleId) {
     setModule(next);
-    localStorage.setItem('mainworker:module', next);
     const params = new URLSearchParams(location.search);
     params.set('module', next);
     if (next !== 'articles') {
@@ -51,6 +51,14 @@ export function WorkbenchApp() {
       params.delete('source');
     }
     history.replaceState(null, '', `/?${params}`);
+  }
+
+  function toggleRail() {
+    setRailCollapsed((current) => {
+      const next = !current;
+      localStorage.setItem('mainworker:rail-collapsed', next ? '1' : '0');
+      return next;
+    });
   }
 
   async function login(event: SyntheticEvent<HTMLFormElement>) {
@@ -82,11 +90,20 @@ export function WorkbenchApp() {
   if (authenticated === null) return <main className="boot-screen"><span className="brand-mark">M</span><p>正在打开 MainWorker…</p></main>;
 
   return (
-    <main className="workbench-shell">
-      <aside className="app-rail" aria-label="工作台导航">
-        <div className="brand-mark" aria-label="MainWorker">M</div>
-        <nav className="rail-nav">{modules.map((item) => <Button key={item.id} className={`rail-button ${module === item.id ? 'is-active' : ''}`} variant="ghost" size="icon-lg" aria-label={item.label} title={item.label} onClick={() => changeModule(item.id)}><item.icon /></Button>)}</nav>
-        <Button className="rail-button rail-settings" variant="ghost" size="icon-lg" aria-label="设置" onClick={() => setSettingsOpen(true)}><Settings2 /></Button>
+    <main className={`workbench-shell ${railCollapsed ? 'is-rail-collapsed' : ''}`}>
+      <aside className={`app-rail ${railCollapsed ? 'is-collapsed' : ''}`} aria-label="工作台导航">
+        {railCollapsed ? (
+          <Button className="rail-button rail-expand" variant="ghost" size="icon-sm" aria-label="展开工具栏" title="展开工具栏" onClick={toggleRail}><PanelLeftOpen /></Button>
+        ) : (
+          <>
+            <div className="brand-mark" aria-label="MainWorker">M</div>
+            <nav className="rail-nav">{modules.map((item) => <Button key={item.id} className={`rail-button ${module === item.id ? 'is-active' : ''}`} variant="ghost" size="icon-lg" aria-label={item.label} title={item.label} onClick={() => changeModule(item.id)}><item.icon /></Button>)}</nav>
+            <div className="rail-footer">
+              <Button className="rail-button" variant="ghost" size="icon-lg" aria-label="折叠工具栏" title="折叠工具栏" onClick={toggleRail}><PanelLeftClose /></Button>
+              <Button className="rail-button" variant="ghost" size="icon-lg" aria-label="设置" title="设置" onClick={() => setSettingsOpen(true)}><Settings2 /></Button>
+            </div>
+          </>
+        )}
       </aside>
 
       <div className="module-stage">

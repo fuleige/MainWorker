@@ -47,7 +47,10 @@ const activeRunsById = new Map();
 const loginAttempts = new Map();
 const LOGIN_WINDOW_MS = 10 * 60 * 1000;
 const LOGIN_ATTEMPT_LIMIT = 6;
+const MODEL_CATALOG_TTL_MS = 5 * 60 * 1000;
 const REPLAYABLE_EVENTS = new Set(['run', 'meta', 'activity', 'reasoning', 'plan', 'metrics', 'error']);
+let modelCatalogCache = { fetchedAt: 0, catalog: null };
+let modelCatalogPromise = null;
 
 codex.on('event', (message) => {
   if (message.method === 'account/rateLimits/updated') rateLimits.applyUpdate(message.params?.rateLimits);
@@ -158,10 +161,73 @@ function resolveChatContext(scopeValue, articlePathValue, sourceIdValue) {
 function publicSession(session) {
   return {
     id: Number(session.id), scope: session.scope, contextKey: session.context_key,
-    threadId: session.thread_id || null, title: session.title,
+    threadId: session.thread_id || null, title: session.title, mode: session.mode === 'quick' ? 'quick' : 'work',
+    model: session.model || null, reasoningEffort: session.reasoning_effort || null,
     createdAt: session.created_at, updatedAt: session.activity_at || session.updated_at,
     turnCount: Number(session.turn_count || 0), running: activeRunsBySession.has(Number(session.id)),
   };
+}
+
+function publicModel(model) {
+  return {
+    id: String(model.model || model.id),
+    name: String(model.displayName || model.model || model.id),
+    description: String(model.description || ''),
+    isDefault: Boolean(model.isDefault),
+    defaultReasoningEffort: String(model.defaultReasoningEffort || 'medium'),
+    reasoningEfforts: (model.supportedReasoningEfforts || []).map((option) => ({
+      id: String(option.reasoningEffort),
+      description: String(option.description || ''),
+    })),
+  };
+}
+
+async function readModelCatalog() {
+  const now = Date.now();
+  if (modelCatalogCache.catalog && now - modelCatalogCache.fetchedAt < MODEL_CATALOG_TTL_MS) return modelCatalogCache.catalog;
+  if (modelCatalogPromise) return modelCatalogPromise;
+  modelCatalogPromise = (async () => {
+    const [models, configResult] = await Promise.all([codex.listModels(projectRoot), codex.readConfig(projectRoot)]);
+    const configuredModel = configResult.config?.model;
+    const defaultModel = models.find((model) => model.model === configuredModel || model.id === configuredModel)
+      || models.find((model) => model.isDefault)
+      || models[0];
+    if (!defaultModel) throw new Error('Codex 没有返回可用模型');
+    const configuredEffort = configResult.config?.model_reasoning_effort;
+    const supportsConfiguredEffort = defaultModel.supportedReasoningEfforts?.some((option) => option.reasoningEffort === configuredEffort);
+    const catalog = {
+      models,
+      defaultModel: defaultModel.model,
+      defaultReasoningEffort: supportsConfiguredEffort ? configuredEffort : defaultModel.defaultReasoningEffort,
+    };
+    modelCatalogCache = { fetchedAt: Date.now(), catalog };
+    return catalog;
+  })();
+  try {
+    return await modelCatalogPromise;
+  } finally {
+    modelCatalogPromise = null;
+  }
+}
+
+function defaultEffortFor(mode, model, catalog) {
+  if (mode === 'quick' && model.supportedReasoningEfforts?.some((option) => option.reasoningEffort === 'low')) return 'low';
+  if (model.model === catalog.defaultModel && model.supportedReasoningEfforts?.some((option) => option.reasoningEffort === catalog.defaultReasoningEffort)) {
+    return catalog.defaultReasoningEffort;
+  }
+  return model.defaultReasoningEffort || model.supportedReasoningEfforts?.[0]?.reasoningEffort || 'medium';
+}
+
+async function ensureConcreteSessionSettings(session) {
+  if (session.model && session.reasoning_effort) return session;
+  const catalog = await readModelCatalog();
+  const model = catalog.models.find((entry) => entry.model === session.model || entry.id === session.model)
+    || catalog.models.find((entry) => entry.model === catalog.defaultModel)
+    || catalog.models[0];
+  const effortSupported = model.supportedReasoningEfforts?.some((option) => option.reasoningEffort === session.reasoning_effort);
+  const effort = effortSupported ? session.reasoning_effort : defaultEffortFor(session.mode, model, catalog);
+  database.updateSessionSettings(session.id, model.model, effort);
+  return database.getSession(session.scope, session.context_key, session.id);
 }
 
 function publicTask(task) {
@@ -303,12 +369,17 @@ function publicRun(run) {
 }
 
 async function ensureThread(session, context) {
+  const settings = {
+    mode: session.mode === 'quick' ? 'quick' : 'work',
+    model: session.model || null,
+    reasoningEffort: session.reasoning_effort || null,
+  };
   if (!session.thread_id) {
-    const thread = await codex.createThread(context);
+    const thread = await codex.createThread(context, settings);
     database.attachThread(session.id, thread.id);
     return { threadId: thread.id, restored: false };
   }
-  await codex.resumeThread(session.thread_id, context);
+  await codex.resumeThread(session.thread_id, context, settings);
   database.touchSession(session.id);
   return { threadId: session.thread_id, restored: true };
 }
@@ -406,13 +477,19 @@ async function executeRun(run, session) {
     publishRun(run, 'activity', { phase: 'context', label: thread.restored ? '永久上下文已恢复' : '永久上下文已创建' });
     if (run.cancelRequested) { completed = true; run.status = 'interrupted'; publishRun(run, 'final', { text: '', html: '', status: run.status }); cleanup(); finishRun(run); return; }
     codex.on('event', onEvent);
-    const scopePrompt = run.context.scope === 'workspace'
-      ? ['当前是 MainWorker 个人工作台的主对话。', `当前工作目录：${projectRoot}`, '结合长期线程上下文处理用户请求。']
+    const scopePrompt = session.mode === 'quick'
+      ? ['当前是 MainWorker 快速问答。', '请直接回答一般问题；需要最新信息或事实核验时使用联网搜索。', '不要访问本地文件或调用本地工具。']
+      : run.context.scope === 'workspace'
+        ? ['当前是 MainWorker 个人工作台的主对话。', `当前工作目录：${projectRoot}`, '结合长期线程上下文处理用户请求。']
       : run.context.scope === 'articles'
         ? [`当前是文章来源“${run.context.sourceName}”的项目级持久化对话。`, `文章库目录：${run.context.cwd}`, '请从整个文章库范围理解任务。']
         : [`当前文章来源：${run.context.sourceName}`, `当前工作台文章：${run.context.articlePath}`, '这是该文章的持久化审核对话，请结合此前上下文处理。'];
     const prompt = [...scopePrompt, '用户请求：', run.userText].join('\n\n');
-    const turn = await codex.startTurn(run.threadId, prompt, run.context);
+    const turn = await codex.startTurn(run.threadId, prompt, run.context, {
+      mode: session.mode === 'quick' ? 'quick' : 'work',
+      model: session.model || null,
+      reasoningEffort: session.reasoning_effort || null,
+    });
     run.turnId = turn.id;
     database.createTurn({ sessionId: run.sessionId, threadId: run.threadId, turnId: run.turnId, userText: run.userText });
     persistPendingEvents(run);
@@ -429,8 +506,9 @@ async function startChat(request, response) {
   const context = resolveChatContext(body.scope, body.articlePath, body.sourceId);
   const sessionId = positiveId(body.sessionId);
   if (!sessionId) return sendError(response, 400, '会话编号无效');
-  const session = database.getSession(context.scope, context.key, sessionId);
+  let session = database.getSession(context.scope, context.key, sessionId);
   if (!session) return sendError(response, 404, '会话不存在');
+  session = await ensureConcreteSessionSettings(session);
   const userText = String(body.message || '').trim();
   if (!userText) return sendError(response, 400, '消息不能为空');
   if (userText.length > 20_000) return sendError(response, 400, '消息过长');
@@ -543,12 +621,59 @@ async function requestHandler(request, response) {
   }
   if (request.method === 'GET' && url.pathname === '/api/chat/sessions') {
     const context = resolveChatContext(url.searchParams.get('scope'), url.searchParams.get('article'), url.searchParams.get('source'));
-    return sendJson(response, 200, { sessions: database.listSessions(context.scope, context.key).map(publicSession) });
+    const sessions = await Promise.all(database.listSessions(context.scope, context.key).map(ensureConcreteSessionSettings));
+    return sendJson(response, 200, { sessions: sessions.map(publicSession) });
   }
   if (request.method === 'POST' && url.pathname === '/api/chat/sessions') {
     const body = await readJson(request, 4096);
     const context = resolveChatContext(body.scope, body.articlePath, body.sourceId);
-    return sendJson(response, 201, { session: publicSession(database.createSession(context.scope, context.key)) });
+    const mode = String(body.mode || 'work');
+    if (!['work', 'quick'].includes(mode)) return sendError(response, 400, '对话模式无效');
+    if (mode === 'quick' && context.scope !== 'workspace') return sendError(response, 400, '快速问答只支持主对话界面');
+    const catalog = await readModelCatalog();
+    const requestedModel = body.model == null || body.model === '' ? null : String(body.model);
+    const requestedEffort = body.reasoningEffort == null || body.reasoningEffort === '' ? null : String(body.reasoningEffort);
+    const model = requestedModel
+      ? catalog.models.find((entry) => entry.model === requestedModel || entry.id === requestedModel)
+      : catalog.models.find((entry) => entry.model === catalog.defaultModel) || catalog.models[0];
+    if (!model) return sendError(response, requestedModel ? 400 : 503, requestedModel ? '所选模型不可用' : '暂时无法读取可用模型');
+    const effort = requestedEffort || defaultEffortFor(mode, model, catalog);
+    if (!(model.supportedReasoningEfforts || []).some((option) => option.reasoningEffort === effort)) {
+      return sendError(response, 400, '所选模型不支持这个推理强度');
+    }
+    return sendJson(response, 201, { session: publicSession(database.createSession(context.scope, context.key, mode, model.model, effort)) });
+  }
+  if (request.method === 'PATCH' && url.pathname === '/api/chat/sessions') {
+    const body = await readJson(request, 4096);
+    const context = resolveChatContext(body.scope, body.articlePath, body.sourceId);
+    const sessionId = positiveId(body.sessionId);
+    const session = sessionId && database.getSession(context.scope, context.key, sessionId);
+    if (!session) return sendError(response, 404, '会话不存在');
+    if (activeRunsBySession.has(sessionId)) return sendError(response, 409, '运行中的会话不能切换模型');
+
+    const requestedModel = body.model == null || body.model === '' ? null : String(body.model);
+    const requestedEffort = body.reasoningEffort == null || body.reasoningEffort === '' ? null : String(body.reasoningEffort);
+    const catalog = await readModelCatalog();
+    const selectedModel = requestedModel
+      ? catalog.models.find((model) => model.model === requestedModel || model.id === requestedModel)
+      : catalog.models.find((model) => model.model === catalog.defaultModel) || catalog.models[0];
+    if (requestedModel && !selectedModel) return sendError(response, 400, '所选模型不可用');
+    if (!selectedModel) return sendError(response, 503, '暂时无法读取可用模型');
+    const selectedEffort = requestedEffort || defaultEffortFor(session.mode, selectedModel, catalog);
+    if (!(selectedModel.supportedReasoningEfforts || []).some((option) => option.reasoningEffort === selectedEffort)) {
+      return sendError(response, 400, '所选模型不支持这个推理强度');
+    }
+
+    database.updateSessionSettings(sessionId, selectedModel.model, selectedEffort);
+    return sendJson(response, 200, { session: publicSession(database.getSession(context.scope, context.key, sessionId)) });
+  }
+  if (request.method === 'GET' && url.pathname === '/api/chat/models') {
+    const catalog = await readModelCatalog();
+    return sendJson(response, 200, {
+      models: catalog.models.map(publicModel),
+      defaultModel: catalog.defaultModel,
+      defaultReasoningEffort: catalog.defaultReasoningEffort,
+    });
   }
   if (request.method === 'DELETE' && url.pathname === '/api/chat/sessions') {
     const body = await readJson(request, 4096);

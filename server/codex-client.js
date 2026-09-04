@@ -45,7 +45,7 @@ export class CodexAppServerClient extends EventEmitter {
     this.lines = readline.createInterface({ input: this.child.stdout });
     this.lines.on('line', (line) => this.#handleLine(line));
     await this.#requestRaw('initialize', {
-      clientInfo: { name: 'mainworker_web', title: 'MainWorker Web', version: '0.1.0' },
+      clientInfo: { name: 'mainworker_web', title: 'MainWorker Web', version: '0.1.1' },
       capabilities: {},
     });
     this.notify('initialized', {});
@@ -116,8 +116,56 @@ export class CodexAppServerClient extends EventEmitter {
     if (message.method) this.emit('event', message);
   }
 
-  threadOptions(context) {
-    return {
+  threadOptions(context, settings = {}) {
+    const { mode = 'work', model = null, reasoningEffort = null } = settings;
+    if (mode === 'quick') {
+      return {
+        ...(model ? { model } : {}),
+        cwd: context.cwd,
+        approvalPolicy: 'never',
+        sandbox: 'read-only',
+        ephemeral: false,
+        serviceName: 'mainworker-web-quick',
+        personality: 'friendly',
+        baseInstructions: [
+          'You are MainWorker Quick Q&A, a concise and helpful general-purpose assistant.',
+          'Answer the question directly and keep the response proportional to the request.',
+          'Use web search when the user asks for current information or when freshness or factual uncertainty matters.',
+          'Do not inspect, edit, or discuss the local workspace unless the user switches to a work conversation.',
+        ].join(' '),
+        developerInstructions: [
+          'This is a lightweight question-answering conversation, not an agentic coding session.',
+          'The only tool you may use is web search.',
+          'Never run shell commands, access local files, modify files, invoke apps, plugins, MCP tools, skills, image tools, goals, or subagents.',
+          'If a request requires local project access or changes, briefly ask the user to start a work conversation instead.',
+          'When web search is used, cite the supporting sources in the answer.',
+          'Never reveal credentials, tokens, or unrelated private data.',
+        ].join(' '),
+        config: {
+          web_search: 'live',
+          model_reasoning_effort: reasoningEffort || 'low',
+          tools: {
+            web_search: { context_size: 'low' },
+            view_image: false,
+          },
+          features: {
+            apps: false,
+            browser_use: false,
+            code_mode: false,
+            computer_use: false,
+            goals: false,
+            image_generation: false,
+            multi_agent: false,
+            plugins: false,
+            shell_tool: false,
+            sleep_tool: false,
+            unified_exec: false,
+            view_image: false,
+          },
+        },
+      };
+    }
+    const options = {
       cwd: context.cwd,
       approvalPolicy: 'never',
       sandbox: 'danger-full-access',
@@ -131,30 +179,52 @@ export class CodexAppServerClient extends EventEmitter {
         'Do not start persistent network services or perform destructive actions unless explicitly requested.',
       ].join(' '),
     };
+    if (model) options.model = model;
+    if (reasoningEffort) options.config = { model_reasoning_effort: reasoningEffort };
+    return options;
   }
 
-  async createThread(context) {
-    const result = await this.request('thread/start', this.threadOptions(context), context.cwd);
+  async createThread(context, settings = {}) {
+    const result = await this.request('thread/start', this.threadOptions(context, settings), context.cwd);
     this.resumedThreads.add(result.thread.id);
     return result.thread;
   }
 
-  async resumeThread(threadId, context) {
+  async resumeThread(threadId, context, settings = {}) {
     if (this.resumedThreads.has(threadId)) return;
-    await this.request('thread/resume', { threadId, ...this.threadOptions(context) }, context.cwd);
+    await this.request('thread/resume', { threadId, ...this.threadOptions(context, settings) }, context.cwd);
     this.resumedThreads.add(threadId);
   }
 
-  async startTurn(threadId, text, context) {
-    await this.resumeThread(threadId, context);
+  async startTurn(threadId, text, context, settings = {}) {
+    await this.resumeThread(threadId, context, settings);
     const result = await this.request('turn/start', {
       threadId,
       input: [{ type: 'text', text }],
       cwd: context.cwd,
       approvalPolicy: 'never',
-      sandboxPolicy: { type: 'dangerFullAccess' },
+      sandboxPolicy: settings.mode === 'quick'
+        ? { type: 'readOnly', networkAccess: true }
+        : { type: 'dangerFullAccess' },
+      ...(settings.model ? { model: settings.model } : {}),
+      ...(settings.reasoningEffort ? { effort: settings.reasoningEffort } : {}),
     }, context.cwd);
     return result.turn;
+  }
+
+  async listModels(cwd) {
+    const models = [];
+    let cursor = null;
+    do {
+      const result = await this.request('model/list', { cursor, limit: 100, includeHidden: false }, cwd);
+      models.push(...result.data);
+      cursor = result.nextCursor;
+    } while (cursor);
+    return models;
+  }
+
+  readConfig(cwd) {
+    return this.request('config/read', { cwd, includeLayers: false }, cwd);
   }
 
   interruptTurn(threadId, turnId, cwd) {

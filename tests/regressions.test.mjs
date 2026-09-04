@@ -2,8 +2,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { CodexAppServerClient } from '../server/codex-client.js';
 import { ContentRepository, renderMarkdown } from '../server/content.js';
 import { WorkbenchDatabase } from '../server/db.js';
 import { normalizeCodeLanguage, withCodeLineMarkup } from '../lib/code-highlight.js';
@@ -29,6 +31,73 @@ test('deleting an older conversation preserves the other sessions', () => {
   }
 });
 
+test('chat mode and model settings persist with a safe legacy migration', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mainworker-session-settings-test-'));
+  const databasePath = path.join(directory, 'mainworker.sqlite');
+  const legacy = new DatabaseSync(databasePath);
+  legacy.exec(`
+    CREATE TABLE chat_sessions (
+      id INTEGER PRIMARY KEY,
+      scope TEXT NOT NULL,
+      context_key TEXT NOT NULL,
+      thread_id TEXT UNIQUE,
+      title TEXT NOT NULL DEFAULT '新会话',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    INSERT INTO chat_sessions(scope, context_key) VALUES ('workspace', 'workspace');
+  `);
+  legacy.close();
+
+  const database = new WorkbenchDatabase(directory);
+  try {
+    const migrated = database.getSession('workspace', 'workspace', 1);
+    assert.equal(migrated.mode, 'work');
+    assert.equal(migrated.model, null);
+    assert.equal(migrated.reasoning_effort, null);
+
+    const quick = database.createSession('workspace', 'workspace', 'quick');
+    database.updateSessionSettings(quick.id, 'gpt-5.6-luna', 'medium');
+    const restored = database.getSession('workspace', 'workspace', quick.id);
+    assert.equal(restored.mode, 'quick');
+    assert.equal(restored.model, 'gpt-5.6-luna');
+    assert.equal(restored.reasoning_effort, 'medium');
+  } finally {
+    database.database.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('quick conversations retain web search while disabling local agent tools', async () => {
+  const client = new CodexAppServerClient();
+  const context = { cwd: projectRoot };
+  const settings = { mode: 'quick', model: 'gpt-5.6-sol', reasoningEffort: 'low' };
+  const options = client.threadOptions(context, settings);
+
+  assert.equal(options.model, 'gpt-5.6-sol');
+  assert.equal(options.sandbox, 'read-only');
+  assert.equal(options.config.web_search, 'live');
+  assert.equal(options.config.model_reasoning_effort, 'low');
+  assert.equal(options.config.tools.web_search.context_size, 'low');
+  assert.equal(options.config.tools.view_image, false);
+  assert.equal(options.config.features.shell_tool, false);
+  assert.equal(options.config.features.unified_exec, false);
+  assert.equal(options.config.features.plugins, false);
+  assert.equal(options.config.features.multi_agent, false);
+
+  const calls = [];
+  client.request = async (method, params) => {
+    calls.push({ method, params });
+    if (method === 'thread/resume') return { thread: { id: 'thread-quick' } };
+    return { turn: { id: 'turn-quick' } };
+  };
+  await client.startTurn('thread-quick', '今天有什么新闻？', context, settings);
+  const turnStart = calls.find((call) => call.method === 'turn/start');
+  assert.deepEqual(turnStart.params.sandboxPolicy, { type: 'readOnly', networkAccess: true });
+  assert.equal(turnStart.params.model, 'gpt-5.6-sol');
+  assert.equal(turnStart.params.effort, 'low');
+});
+
 test('planner tasks support persisted parent-child relationships', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mainworker-planner-test-'));
   const database = new WorkbenchDatabase(directory);
@@ -52,6 +121,9 @@ test('chat layout keeps the composer fixed while messages scroll independently',
   assert.match(css, /\.chat-workspace\s*\{[^}]*min-height:\s*0;[^}]*overflow:\s*hidden;/s);
   assert.match(css, /\.chat-surface\s*\{[^}]*grid-template-rows:[^;}]*minmax\(0,1fr\)[^}]*min-height:\s*0;[^}]*overflow:\s*hidden;/s);
   assert.match(css, /\.message-stage\s*\{[^}]*min-height:\s*0;[^}]*overflow-y:\s*auto;/s);
+  assert.match(css, /\.chat-surface\s*\{[^}]*--chat-content-width:\s*960px/s);
+  assert.match(css, /\.message-thread\s*\{[^}]*width:\s*min\(var\(--chat-content-width\),\s*100%\)/s);
+  assert.match(css, /\.composer\s*\{[^}]*width:\s*min\(var\(--chat-content-width\),\s*100%\)/s);
   assert.doesNotMatch(chat, /scrollIntoView/);
   assert.match(chat, /const movedUp = stage\.scrollTop < lastScrollTop\.current - 1/);
   assert.match(chat, /if \(movedUp\) followLatest\.current = false/);
@@ -159,6 +231,39 @@ test('session rows expose deletion and article refresh does not change the mobil
   assert.match(articles, /status\.updatedAt !== current\.updatedAt/);
   assert.match(articles, /reader\.scrollTop = pending\.scrollTop/);
   assert.match(articles, /target\.getBoundingClientRect\(\)\.top/);
+});
+
+test('the main chat exposes persisted quick mode, model controls, and independent sidebar toggles', () => {
+  const chat = fs.readFileSync(path.join(projectRoot, 'components/chat-workspace.tsx'), 'utf8');
+  const hook = fs.readFileSync(path.join(projectRoot, 'hooks/use-chat.ts'), 'utf8');
+  const app = fs.readFileSync(path.join(projectRoot, 'components/workbench-app.tsx'), 'utf8');
+  const server = fs.readFileSync(path.join(projectRoot, 'server/index.js'), 'utf8');
+  const css = fs.readFileSync(path.join(projectRoot, 'app/globals.css'), 'utf8');
+
+  assert.match(chat, /<Globe2 \/>快速问答/);
+  assert.match(chat, /联网搜索 · 不访问本地文件/);
+  assert.match(chat, /className="conversation-mode-switch"/);
+  assert.match(chat, /<Command \/>工作模式/);
+  assert.match(chat, /极高 XHigh/);
+  assert.match(chat, /className="collapsed-sidebar-actions"[\s\S]*aria-label="新会话"/);
+  assert.match(css, /\.scroll-to-bottom\s*\{[^}]*right:\s*max\(12px,\s*calc\(\(100% - var\(--chat-content-width\)\) \/ 2 - 52px\)\);[^}]*bottom:\s*14px/s);
+  assert.doesNotMatch(css, /\.scroll-to-bottom\s*\{[^}]*left:\s*50%/s);
+  assert.match(chat, /aria-label="选择模型"/);
+  assert.match(chat, /aria-label="选择推理强度"/);
+  assert.doesNotMatch(chat, />默认模型</);
+  assert.doesNotMatch(chat, />默认强度</);
+  assert.match(hook, /startNewSession = useCallback\(async \(mode: ChatMode = 'work'\)/);
+  assert.match(hook, /context\.scope === 'workspace' && preferredId === undefined[\s\S]*setCurrentSession\(null\)/);
+  assert.match(hook, /if \(!session\) \{[\s\S]*?\/api\/chat\/sessions[\s\S]*?mode: draftMode/);
+  assert.match(hook, /method: 'PATCH'/);
+  assert.match(server, /mode === 'quick' && context\.scope !== 'workspace'/);
+  assert.match(server, /url\.pathname === '\/api\/chat\/models'/);
+  assert.match(app, /const initialModule = requested ===[\s\S]*?: 'chat';/);
+  assert.doesNotMatch(app, /mainworker:module/);
+  assert.match(app, /mainworker:rail-collapsed/);
+  assert.match(chat, /mainworker:chat-sidebar-collapsed/);
+  assert.match(css, /\.workbench-shell\.is-rail-collapsed\s*\{[^}]*grid-template-columns:\s*34px/s);
+  assert.match(css, /\.chat-workspace\.is-sidebar-collapsed\s*\{[^}]*grid-template-columns:\s*48px/s);
 });
 
 test('article sources can list, read and render assets without legacy signature errors', async () => {

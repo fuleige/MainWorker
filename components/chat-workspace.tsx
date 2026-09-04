@@ -5,9 +5,12 @@ import {
   ArrowDown,
   Bookmark,
   Command,
+  Globe2,
   LoaderCircle,
   Menu,
   MessageSquareText,
+  PanelLeftClose,
+  PanelLeftOpen,
   Plus,
   Send,
   Sparkles,
@@ -26,7 +29,16 @@ import {
 import { Textarea } from '@/components/ui/textarea';
 import { StreamingMarkdown } from '@/components/streaming-markdown';
 import { api } from '@/lib/workbench-api';
-import { ChatSession, useChat } from '@/hooks/use-chat';
+import { ChatMode, ChatSession, useChat } from '@/hooks/use-chat';
+
+const effortLabels: Record<string, string> = {
+  low: '低 Low',
+  medium: '中 Medium',
+  high: '高 High',
+  xhigh: '极高 XHigh',
+  max: '最大 Max',
+  ultra: '极限 Ultra',
+};
 
 type ChatWorkspaceProps = {
   scope: 'workspace' | 'articles' | 'article';
@@ -57,7 +69,7 @@ function SessionList({
           <div className={`conversation-row ${session.id === current?.id ? 'is-active' : ''}`} key={session.id}>
             <button className="conversation-item" onClick={() => onSelect(session)} type="button">
               <span className="conversation-name"><strong>{session.title}</strong>{session.running && <i />}</span>
-              <span>{session.turnCount ? `${session.turnCount} 轮对话` : '尚未开始'}</span>
+              <span>{session.mode === 'quick' ? '快速问答' : '工作模式'} · {session.turnCount ? `${session.turnCount} 轮` : '尚未开始'}</span>
             </button>
             <Button
               className="conversation-delete"
@@ -76,6 +88,24 @@ function SessionList({
       <div className="session-list-actions">
         <Button variant="outline" onClick={onCreate}><Plus />新会话</Button>
       </div>
+    </div>
+  );
+}
+
+function ConversationModeSwitch({
+  mode, onChange,
+}: {
+  mode: ChatMode;
+  onChange: (mode: ChatMode) => void;
+}) {
+  return (
+    <div className="conversation-mode-switch" aria-label="对话模式">
+      <button type="button" className={mode === 'work' ? 'is-active' : ''} aria-pressed={mode === 'work'} onClick={() => mode !== 'work' && onChange('work')} title="切换时新建一个工作模式会话">
+        <Command />工作模式
+      </button>
+      <button type="button" className={mode === 'quick' ? 'is-active is-quick' : ''} aria-pressed={mode === 'quick'} onClick={() => mode !== 'quick' && onChange('quick')} title="切换时新建一个快速问答会话">
+        <Globe2 />快速问答
+      </button>
     </div>
   );
 }
@@ -126,9 +156,17 @@ export function ChatWorkspace(props: ChatWorkspaceProps) {
   const [draft, setDraft] = useState('');
   const [deletingId, setDeletingId] = useState<number | null>(null);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const messageStage = useRef<HTMLDivElement>(null);
   const followLatest = useRef(true);
   const lastScrollTop = useRef(0);
+  const quickMode = props.scope === 'workspace' && chat.currentMode === 'quick';
+  const newSession = props.scope === 'workspace' && !chat.currentSession;
+
+  useEffect(() => {
+    if (props.compact) return;
+    queueMicrotask(() => setSidebarCollapsed(localStorage.getItem('mainworker:chat-sidebar-collapsed') === '1'));
+  }, [props.compact]);
 
   useEffect(() => {
     const stage = messageStage.current;
@@ -185,18 +223,85 @@ export function ChatWorkspace(props: ChatWorkspaceProps) {
     void chat.send(message);
   }
 
+  function startNewSession(mode: ChatMode = 'work', clearDraft = true) {
+    if (clearDraft) setDraft('');
+    followLatest.current = true;
+    setShowScrollToBottom(false);
+    void chat.startNewSession(mode);
+  }
+
+  function toggleSidebar() {
+    setSidebarCollapsed((current) => {
+      const next = !current;
+      localStorage.setItem('mainworker:chat-sidebar-collapsed', next ? '1' : '0');
+      return next;
+    });
+  }
+
+  const selectedModel = chat.models.find((model) => model.id === chat.currentModel)
+    || chat.models.find((model) => model.isDefault)
+    || chat.models[0];
+  const modelControls = !props.compact && props.scope === 'workspace' ? (
+    <div className={`model-controls ${chat.settingsSaving ? 'is-saving' : ''}`} aria-label="模型设置">
+      <NativeSelect
+        className="model-picker"
+        size="sm"
+        value={chat.currentModel || ''}
+        disabled={chat.sending || chat.settingsSaving}
+        onChange={(event) => {
+          const model = event.target.value;
+          const target = chat.models.find((item) => item.id === model);
+          if (!target) return;
+          const currentEffort = chat.currentReasoningEffort || '';
+          const compatibleEffort = target.reasoningEfforts.some((effort) => effort.id === currentEffort)
+            ? currentEffort
+            : target.defaultReasoningEffort;
+          void chat.updateSessionSettings(model, compatibleEffort);
+        }}
+        aria-label="选择模型"
+        title="选择当前会话使用的模型"
+      >
+        {chat.models.length
+          ? chat.models.map((model) => <NativeSelectOption key={model.id} value={model.id}>{model.name}</NativeSelectOption>)
+          : <NativeSelectOption value={chat.currentModel || ''}>{chat.currentModel || '正在读取模型'}</NativeSelectOption>}
+      </NativeSelect>
+      <NativeSelect
+        className="effort-picker"
+        size="sm"
+        value={chat.currentReasoningEffort || ''}
+        disabled={chat.sending || chat.settingsSaving || !selectedModel}
+        onChange={(event) => void chat.updateSessionSettings(chat.currentModel || '', event.target.value)}
+        aria-label="选择推理强度"
+        title="选择当前会话使用的推理强度"
+      >
+        {selectedModel?.reasoningEfforts.length
+          ? selectedModel.reasoningEfforts.map((effort) => <NativeSelectOption key={effort.id} value={effort.id}>{effortLabels[effort.id] || effort.id}</NativeSelectOption>)
+          : <NativeSelectOption value={chat.currentReasoningEffort || ''}>{effortLabels[chat.currentReasoningEffort || ''] || chat.currentReasoningEffort || '正在读取强度'}</NativeSelectOption>}
+      </NativeSelect>
+    </div>
+  ) : null;
+
   const sessionList = (
-    <SessionList sessions={chat.sessions} current={chat.currentSession} deletingId={deletingId} onSelect={(session) => void chat.selectSession(session)} onCreate={() => void chat.createSession()} onDelete={(session) => void removeSession(session)} />
+    <SessionList sessions={chat.sessions} current={chat.currentSession} deletingId={deletingId} onSelect={(session) => void chat.selectSession(session)} onCreate={() => startNewSession()} onDelete={(session) => void removeSession(session)} />
   );
 
   return (
-    <section className={`chat-workspace ${props.compact ? 'is-compact' : ''}`}>
+    <section className={`chat-workspace ${props.compact ? 'is-compact' : ''} ${sidebarCollapsed && !props.compact ? 'is-sidebar-collapsed' : ''}`}>
       {!props.compact && (
-        <aside className="conversation-sidebar">
-          <header className="sidebar-header"><div><p className="overline">MAIN WORKER</p><h1>对话</h1></div><Button variant="outline" size="icon" onClick={() => void chat.createSession()}><Plus /></Button></header>
-          <div className="workspace-picker static"><span className="workspace-icon"><Command /></span><span><strong>MainWorker</strong><small>当前工作目录</small></span></div>
-          {sessionList}
-          <footer className="sidebar-footer"><span className={`status-dot ${chat.error ? 'is-error' : ''}`} /><span>{chat.error || 'Codex App Server 就绪'}</span></footer>
+        <aside className={`conversation-sidebar ${sidebarCollapsed ? 'is-collapsed' : ''}`}>
+          {sidebarCollapsed ? (
+            <div className="collapsed-sidebar-actions">
+              <Button className="sidebar-expand" variant="ghost" size="icon-sm" onClick={toggleSidebar} aria-label="展开会话列表" title="展开会话列表"><PanelLeftOpen /></Button>
+              <Button variant="ghost" size="icon-sm" onClick={() => startNewSession()} aria-label="新会话" title="新会话"><Plus /></Button>
+            </div>
+          ) : (
+            <>
+              <header className="sidebar-header"><div><p className="overline">MAIN WORKER</p><h1>对话</h1></div><div className="sidebar-header-actions"><Button variant="outline" size="icon" onClick={() => startNewSession()} aria-label="新会话" title="新会话"><Plus /></Button><Button variant="ghost" size="icon" onClick={toggleSidebar} aria-label="折叠会话列表" title="折叠会话列表"><PanelLeftClose /></Button></div></header>
+              <div className="workspace-picker static"><span className="workspace-icon"><Command /></span><span><strong>MainWorker</strong><small>当前工作目录</small></span></div>
+              {sessionList}
+              <footer className="sidebar-footer"><span className={`status-dot ${chat.error ? 'is-error' : ''}`} /><span>{chat.error || 'Codex App Server 就绪'}</span></footer>
+            </>
+          )}
         </aside>
       )}
 
@@ -208,13 +313,13 @@ export function ChatWorkspace(props: ChatWorkspaceProps) {
               <SheetContent side="left" className="mobile-session-sheet"><SheetHeader><SheetTitle>最近对话</SheetTitle><SheetDescription>选择或创建一个永久会话</SheetDescription></SheetHeader>{sessionList}</SheetContent>
             </Sheet>
           )}
-          <div className="chat-title"><span className="title-icon"><Sparkles /></span><div><h2>{props.title}</h2><p>{props.subtitle}</p></div></div>
+          <div className={`chat-title ${quickMode ? 'is-quick' : ''}`}><span className="title-icon">{quickMode ? <Globe2 /> : <Sparkles />}</span><div><h2>{newSession ? '新会话' : quickMode ? '快速问答' : props.title}</h2><p>{newSession ? (quickMode ? '快速问答 · 联网搜索' : '工作模式 · 当前工作目录') : quickMode ? '联网搜索 · 不访问本地文件' : props.subtitle}</p></div></div>
           {props.compact ? (
             <div className="compact-session-actions">
               <NativeSelect value={chat.currentSession?.id || ''} onChange={(event) => { const item = chat.sessions.find((session) => session.id === Number(event.target.value)); if (item) void chat.selectSession(item); }} aria-label="选择会话">
                 {chat.sessions.map((session) => <NativeSelectOption key={session.id} value={session.id}>{session.title}</NativeSelectOption>)}
               </NativeSelect>
-              <Button variant="ghost" size="icon-sm" onClick={() => void chat.createSession()} aria-label="新建审核会话" title="新建会话"><Plus /></Button>
+              <Button variant="ghost" size="icon-sm" onClick={() => startNewSession()} aria-label="新建审核会话" title="新建会话"><Plus /></Button>
               <Button variant="ghost" size="icon-sm" disabled={!chat.currentSession || chat.currentSession.running || deletingId === chat.currentSession.id} onClick={() => { if (chat.currentSession) void removeSession(chat.currentSession); }} aria-label="删除当前审核会话" title="删除当前会话"><Trash2 /></Button>
             </div>
           ) : <span className={`connection-state ${chat.sending ? 'is-working' : ''}`}><i />{chat.sending ? chat.activity : '就绪'}</span>}
@@ -226,7 +331,7 @@ export function ChatWorkspace(props: ChatWorkspaceProps) {
               {chat.error && <div className="chat-inline-error" role="alert">{chat.error}</div>}
               {chat.loading ? <div className="chat-empty"><LoaderCircle className="spin" /><p>正在恢复永久会话…</p></div> : null}
               {!chat.loading && !chat.messages.length ? (
-                <div className="chat-empty"><span><MessageSquareText /></span><h3>从这里开始</h3><p>{props.scope === 'article' ? '让 Codex 审核、改写或直接修改当前文章。' : props.scope === 'articles' ? '从整个文章库范围整理、检查和规划内容。' : '交代一个任务，对话和执行记录会在刷新后继续保留。'}</p></div>
+                <div className={`chat-empty ${quickMode ? 'is-quick' : ''}`}><span>{quickMode ? <Globe2 /> : <MessageSquareText />}</span><h3>{newSession ? '新会话' : quickMode ? '直接问我' : '从这里开始'}</h3><p>{quickMode ? '适合简单问题；需要最新信息时会自动联网搜索。' : props.scope === 'article' ? '让 Codex 审核、改写或直接修改当前文章。' : props.scope === 'articles' ? '从整个文章库范围整理、检查和规划内容。' : '选择模式后直接输入；发送第一条消息时才会保存这个会话。'}</p></div>
               ) : null}
               {chat.messages.map((message) => (
                 <article className={`message ${message.role === 'user' ? 'user-message' : 'agent-message'} ${message.status === 'failed' ? 'is-error' : ''}`} key={message.id}>
@@ -242,15 +347,16 @@ export function ChatWorkspace(props: ChatWorkspaceProps) {
               <div />
             </div>
           </div>
-          {showScrollToBottom && <Button className="scroll-to-bottom" variant="outline" size="sm" onClick={scrollToLatest} aria-label="回到最新消息"><ArrowDown />回到底部</Button>}
+          {showScrollToBottom && <Button className="scroll-to-bottom" variant="outline" size="sm" onClick={scrollToLatest} aria-label="回到最新消息" title="回到底部"><ArrowDown /><span>回到底部</span></Button>}
         </div>
 
         <div className="composer-wrap">
+          {!props.compact && props.scope === 'workspace' && <ConversationModeSwitch mode={chat.currentMode} onChange={(mode) => startNewSession(mode, false)} />}
           <form className="composer" onSubmit={(event) => { event.preventDefault(); sendDraft(); }}>
-            <Textarea value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); sendDraft(); } }} disabled={chat.sending || !chat.currentSession} aria-label="发送消息" placeholder={chat.sending ? 'Codex 正在处理当前任务…' : '交给 Codex 处理…'} rows={3} />
-            <div className="composer-footer"><QuickPhrases onUse={(text) => setDraft((current) => current ? `${current}\n${text}` : text)} /><span className="shortcut"><kbd>Enter</kbd> 发送 · <kbd>Shift</kbd><kbd>Enter</kbd> 换行</span><Button type="submit" size="icon-lg" disabled={!draft.trim() || chat.sending} aria-label="发送"><Send /></Button></div>
+            <Textarea value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); sendDraft(); } }} disabled={chat.sending} aria-label="发送消息" placeholder={chat.sending ? 'Codex 正在处理当前任务…' : quickMode ? '输入一个问题，需要时会联网搜索…' : '交给 Codex 处理…'} rows={3} />
+            <div className="composer-footer"><QuickPhrases onUse={(text) => setDraft((current) => current ? `${current}\n${text}` : text)} />{modelControls}<span className="shortcut"><kbd>Enter</kbd> 发送 · <kbd>Shift</kbd><kbd>Enter</kbd> 换行</span><Button type="submit" size="icon-lg" disabled={!draft.trim() || chat.sending} aria-label="发送"><Send /></Button></div>
           </form>
-          {!props.compact && <p className="composer-note">Codex 可以读取和修改当前工作目录中的文件</p>}
+          {!props.compact && <p className={`composer-note ${quickMode ? 'is-quick' : ''}`}>{quickMode ? '快速问答不会执行本地命令或修改文件' : 'Codex 可以读取和修改当前工作目录中的文件'}</p>}
         </div>
       </div>
     </section>
