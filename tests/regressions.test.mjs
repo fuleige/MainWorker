@@ -222,6 +222,7 @@ test('article headings, fragment links and task checkboxes survive safe renderin
 test('session rows expose deletion and article refresh does not change the mobile pane', () => {
   const chat = fs.readFileSync(path.join(projectRoot, 'components/chat-workspace.tsx'), 'utf8');
   const articles = fs.readFileSync(path.join(projectRoot, 'components/articles-module.tsx'), 'utf8');
+  const css = fs.readFileSync(path.join(projectRoot, 'app/globals.css'), 'utf8');
   assert.match(chat, /aria-label=\{`删除会话 \$\{session\.title\}`\}/);
   assert.match(chat, /event\.key === 'Enter' && !event\.shiftKey && !event\.nativeEvent\.isComposing/);
   assert.match(articles, /if \(markOpened\) \{[\s\S]*?setMobilePane\('reader'\);[\s\S]*?\}/);
@@ -231,6 +232,16 @@ test('session rows expose deletion and article refresh does not change the mobil
   assert.match(articles, /status\.updatedAt !== current\.updatedAt/);
   assert.match(articles, /reader\.scrollTop = pending\.scrollTop/);
   assert.match(articles, /target\.getBoundingClientRect\(\)\.top/);
+  assert.match(articles, /function buildArticleTree\(articles: ArticleSummary\[\]\)/);
+  assert.match(articles, /kind: 'project' \| 'folder'/);
+  assert.match(articles, /className="article-tree-toggle"[\s\S]*aria-expanded=\{expanded\}/);
+  assert.match(articles, /searching \|\| !collapsedGroups\.has\(group\.key\)/);
+  assert.match(articles, /aria-label="按项目和文件夹分类的文章目录"/);
+  assert.match(articles, /aria-label="搜索文章标题"/);
+  assert.match(articles, /scope="article"/);
+  assert.doesNotMatch(articles, /整个项目|article-scope-tabs|scope=\{scope\}/);
+  assert.match(css, /\.article-tree-children\s*\{[^}]*border-left:/s);
+  assert.match(css, /\.article-tree-group\.is-project > \.article-tree-toggle/);
 });
 
 test('the main chat exposes persisted quick mode, model controls, and independent sidebar toggles', () => {
@@ -280,6 +291,10 @@ test('article sources can list, read and render assets without legacy signature 
     assert.equal(articles[0].sourceId, 'test');
     assert.equal(articles[0].key, 'articles/sample.md');
     assert.equal(articles[0].excerpt.startsWith('示例'), false);
+    assert.equal((await content.listArticles('示例')).length, 1);
+    assert.equal((await content.listArticles('正文摘要')).length, 0);
+    assert.equal((await content.listArticles('sample')).length, 0);
+    assert.equal((await content.listArticles('测试文章')).length, 0);
 
     const article = await content.readArticle('test', 'articles/sample.md');
     assert.doesNotMatch(article.html, /<h1[^>]*>示例<\/h1>/);
@@ -322,6 +337,11 @@ test('the quota module is reachable from desktop and mobile navigation without p
   assert.match(app, /module === 'limits'.*<LimitsModule/);
   assert.doesNotMatch(limits, /setInterval[\s\S]*api<LimitsPayload>/);
   assert.match(limits, /const available = clampPercent\(100 - used\)/);
+  assert.match(limits, /if \(minutes === 7 \* 1440\) return '周额度';/);
+  assert.match(limits, /return `\$\{minutes \/ 60\} 小时额度`/);
+  assert.match(limits, /fallbackTitle="短期额度"/);
+  assert.match(limits, /fallbackTitle="长期额度"/);
+  assert.doesNotMatch(limits, /主要额度|补充额度/);
   assert.match(limits, /className="limit-progress-fill" style=\{\{ width: `\$\{available\}%` \}\}/);
   assert.match(limits, /if \(id === 'codex' \|\| name === 'codex'\) return 0;/);
   assert.match(limits, /if \(identity\.includes\('spark'\)\) return 1;/);

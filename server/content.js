@@ -328,16 +328,17 @@ export class ContentRepository {
         const [markdownSource, stat] = await Promise.all([fs.readFile(absolute, 'utf8'), fs.stat(absolute)]);
         if (isExplicitlyExcluded(markdownSource)) return null;
         const fallback = path.basename(relative, '.md').replace(/[-_]/g, ' ');
+        const title = titleFromMarkdown(markdownSource, fallback);
         return {
           key,
           sourceId: sourceDefinition.id,
           sourceName: sourceDefinition.name,
           path: relative,
-          title: titleFromMarkdown(markdownSource, fallback),
+          title,
           excerpt: excerptFromMarkdown(withoutPrimaryHeading(markdownSource)),
           characters: markdownSource.length,
           updatedAt: stat.mtime.toISOString(),
-          matchesQuery: !normalizedQuery || `${sourceDefinition.name}\n${relative}\n${markdownSource}`.toLowerCase().includes(normalizedQuery),
+          matchesQuery: !normalizedQuery || title.toLowerCase().includes(normalizedQuery),
         };
       }));
     }));

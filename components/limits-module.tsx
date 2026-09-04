@@ -108,11 +108,12 @@ function compareLimits(left: AccountLimit, right: AccountLimit) {
   return limitDisplayOrder(left) - limitDisplayOrder(right);
 }
 
-function windowLabel(minutes: number | null) {
-  if (!minutes) return '额度窗口';
-  if (minutes % 1440 === 0) return `${minutes / 1440} 天窗口`;
-  if (minutes % 60 === 0) return `${minutes / 60} 小时窗口`;
-  return `${minutes} 分钟窗口`;
+function quotaWindowLabel(minutes: number | null, fallback: string) {
+  if (!minutes) return fallback;
+  if (minutes === 7 * 1440) return '周额度';
+  if (minutes % 1440 === 0) return `${minutes / 1440} 天额度`;
+  if (minutes % 60 === 0) return `${minutes / 60} 小时额度`;
+  return `${minutes} 分钟额度`;
 }
 
 function dateTime(value: string | number | null) {
@@ -146,15 +147,15 @@ function untilReset(timestamp: number | null) {
   return `约 ${minutes} 分钟后重置`;
 }
 
-function WindowUsage({ title, window }: { title: string; window: LimitWindow }) {
+function WindowUsage({ fallbackTitle, window }: { fallbackTitle: string; window: LimitWindow }) {
   const used = clampPercent(window.usedPercent);
   const available = clampPercent(100 - used);
   const tone = available <= 10 ? 'critical' : available <= 30 ? 'warning' : 'normal';
+  const title = quotaWindowLabel(window.windowDurationMins, fallbackTitle);
   return (
     <div className={`limit-window ${tone}`}>
       <div className="limit-window-heading">
         <div><span>{title}</span><strong>{available}% 可用</strong></div>
-        <small>{windowLabel(window.windowDurationMins)}</small>
       </div>
       <progress className="sr-only" max={100} value={available} aria-label={`${title}可用额度 ${available}%`} />
       <div className="limit-progress" aria-hidden="true">
@@ -308,8 +309,8 @@ export function LimitsModule({ onUnauthorized }: { onUnauthorized: () => void })
                   <CardAction><Badge variant={limit.reachedType ? 'destructive' : 'secondary'}>{limit.planType || '当前方案'}</Badge></CardAction>
                 </CardHeader>
                 <CardContent className="limit-card-content">
-                  {limit.primary ? <WindowUsage title="主要额度" window={limit.primary} /> : null}
-                  {limit.secondary ? <WindowUsage title="补充额度" window={limit.secondary} /> : null}
+                  {limit.primary ? <WindowUsage fallbackTitle="短期额度" window={limit.primary} /> : null}
+                  {limit.secondary ? <WindowUsage fallbackTitle="长期额度" window={limit.secondary} /> : null}
                   {limit.individualLimit ? (
                     <div className="individual-limit"><span>个人额度</span><strong>{limit.individualLimit.remainingPercent}% 可用</strong><small>{limit.individualLimit.used} / {limit.individualLimit.limit}</small></div>
                   ) : null}

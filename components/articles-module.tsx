@@ -1,7 +1,7 @@
 'use client';
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { BookOpenText, FileText, LoaderCircle, MessageSquareText, Search } from 'lucide-react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { BookOpenText, ChevronRight, FileText, Folder, FolderOpen, LoaderCircle, MessageSquareText, Search } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { api } from '@/lib/workbench-api';
@@ -21,6 +21,112 @@ type ArticleSummary = {
 
 type Article = ArticleSummary & { html: string; source: string };
 
+type ArticleTreeGroup = {
+  key: string;
+  name: string;
+  kind: 'project' | 'folder';
+  count: number;
+  folders: ArticleTreeGroup[];
+  articles: ArticleSummary[];
+};
+
+type MutableArticleTreeGroup = Omit<ArticleTreeGroup, 'folders'> & {
+  folderMap: Map<string, MutableArticleTreeGroup>;
+};
+
+function createArticleTreeGroup(key: string, name: string, kind: ArticleTreeGroup['kind']): MutableArticleTreeGroup {
+  return { key, name, kind, count: 0, folderMap: new Map(), articles: [] };
+}
+
+function finalizeArticleTreeGroup(group: MutableArticleTreeGroup): ArticleTreeGroup {
+  const collator = new Intl.Collator('zh-CN', { numeric: true });
+  return {
+    key: group.key,
+    name: group.name,
+    kind: group.kind,
+    count: group.count,
+    folders: [...group.folderMap.values()]
+      .sort((left, right) => collator.compare(left.name, right.name))
+      .map(finalizeArticleTreeGroup),
+    articles: [...group.articles].sort((left, right) => collator.compare(left.path, right.path)),
+  };
+}
+
+function buildArticleTree(articles: ArticleSummary[]) {
+  const projects = new Map<string, MutableArticleTreeGroup>();
+  for (const article of articles) {
+    let project = projects.get(article.sourceId);
+    if (!project) {
+      project = createArticleTreeGroup(`project:${article.sourceId}`, article.sourceName, 'project');
+      projects.set(article.sourceId, project);
+    }
+    project.count += 1;
+    let group: MutableArticleTreeGroup = project;
+    const folders = article.path.split('/').filter(Boolean).slice(0, -1);
+    let folderPath = '';
+    for (const folderName of folders) {
+      folderPath = folderPath ? `${folderPath}/${folderName}` : folderName;
+      let folder: MutableArticleTreeGroup | undefined = group.folderMap.get(folderName);
+      if (!folder) {
+        folder = createArticleTreeGroup(`folder:${article.sourceId}:${folderPath}`, folderName, 'folder');
+        group.folderMap.set(folderName, folder);
+      }
+      folder.count += 1;
+      group = folder;
+    }
+    group.articles.push(article);
+  }
+  return [...projects.values()].map(finalizeArticleTreeGroup);
+}
+
+function articleFileName(articlePath: string) {
+  return articlePath.split('/').at(-1) || articlePath;
+}
+
+function ArticleTreeGroupView({
+  group, currentKey, collapsedGroups, searching, onToggle, onOpen,
+}: {
+  group: ArticleTreeGroup;
+  currentKey: string | null;
+  collapsedGroups: Set<string>;
+  searching: boolean;
+  onToggle: (key: string) => void;
+  onOpen: (article: ArticleSummary) => void;
+}) {
+  const expanded = searching || !collapsedGroups.has(group.key);
+  return (
+    <section className={`article-tree-group is-${group.kind}`}>
+      <button className="article-tree-toggle" type="button" onClick={() => onToggle(group.key)} aria-expanded={expanded}>
+        <ChevronRight className={expanded ? 'is-expanded' : ''} />
+        {expanded ? <FolderOpen /> : <Folder />}
+        <span>{group.name}</span>
+        <small>{group.count}</small>
+      </button>
+      {expanded ? (
+        <div className="article-tree-children">
+          {group.folders.map((folder) => (
+            <ArticleTreeGroupView
+              key={folder.key}
+              group={folder}
+              currentKey={currentKey}
+              collapsedGroups={collapsedGroups}
+              searching={searching}
+              onToggle={onToggle}
+              onOpen={onOpen}
+            />
+          ))}
+          {group.articles.map((article) => (
+            <button className={`article-item ${currentKey === article.key ? 'is-active' : ''}`} type="button" key={article.key} onClick={() => onOpen(article)} title={article.path}>
+              <span className="article-item-icon"><FileText /></span>
+              <span><strong>{article.title}</strong><small>{article.excerpt || '暂无摘要'}</small><em>{articleFileName(article.path)}</em></span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 function decodeAnchor(value: string) {
   const encoded = value.replace(/^#/, '');
   if (!encoded) return '';
@@ -35,7 +141,7 @@ export function ArticlesModule({ onUnauthorized }: { onUnauthorized: () => void 
   const [articles, setArticles] = useState<ArticleSummary[]>([]);
   const [current, setCurrent] = useState<Article | null>(null);
   const [query, setQuery] = useState('');
-  const [scope, setScope] = useState<'article' | 'articles'>('article');
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set());
   const [mobilePane, setMobilePane] = useState<'library' | 'reader' | 'chat'>('reader');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -44,6 +150,7 @@ export function ArticlesModule({ onUnauthorized }: { onUnauthorized: () => void 
   const pendingReaderPosition = useRef<{ scrollTop: number; anchor: string } | null>(null);
   const refreshInFlight = useRef(false);
   const currentKey = current?.key || null;
+  const articleTree = useMemo(() => buildArticleTree(articles), [articles]);
 
   const openArticle = useCallback(async (sourceId: string, path: string, markOpened = true, anchor = '') => {
     const normalizedAnchor = decodeAnchor(anchor);
@@ -152,6 +259,16 @@ export function ArticlesModule({ onUnauthorized }: { onUnauthorized: () => void 
     searchTimer.current = setTimeout(() => void loadArticles(value.trim()), 180);
   }
 
+  function toggleArticleGroup(key: string) {
+    if (query.trim()) return;
+    setCollapsedGroups((currentGroups) => {
+      const nextGroups = new Set(currentGroups);
+      if (nextGroups.has(key)) nextGroups.delete(key);
+      else nextGroups.add(key);
+      return nextGroups;
+    });
+  }
+
   return (
     <section className={`articles-module mobile-pane-${mobilePane}`}>
       <nav className="article-mobile-nav" aria-label="文章工作区">
@@ -161,15 +278,20 @@ export function ArticlesModule({ onUnauthorized }: { onUnauthorized: () => void 
       </nav>
       <aside className="article-library">
         <header className="article-library-header"><div><p className="overline">KNOWLEDGE</p><h1>文章审核</h1></div><span>{articles.length}</span></header>
-        <div className="article-search"><Search /><Input aria-label="搜索标题或正文" value={query} onChange={(event) => search(event.target.value)} placeholder="搜索标题或正文" /></div>
+        <div className="article-search"><Search /><Input aria-label="搜索文章标题" value={query} onChange={(event) => search(event.target.value)} placeholder="搜索文章标题" /></div>
         {error && <div className="article-error">{error}</div>}
-        <nav className="article-list" aria-label="文章列表">
+        <nav className="article-list" aria-label="按项目和文件夹分类的文章目录">
           {loading ? <div className="article-list-empty"><LoaderCircle className="spin" />正在读取文章…</div> : null}
-          {articles.map((article) => (
-            <button className={`article-item ${current?.key === article.key ? 'is-active' : ''}`} type="button" key={article.key} onClick={() => void openArticle(article.sourceId, article.path)}>
-              <span className="article-item-icon"><FileText /></span>
-              <span><strong>{article.title}</strong><small>{article.excerpt || article.path}</small><em>{article.sourceName} · {article.path}</em></span>
-            </button>
+          {articleTree.map((project) => (
+            <ArticleTreeGroupView
+              key={project.key}
+              group={project}
+              currentKey={currentKey}
+              collapsedGroups={collapsedGroups}
+              searching={Boolean(query.trim())}
+              onToggle={toggleArticleGroup}
+              onOpen={(article) => void openArticle(article.sourceId, article.path)}
+            />
           ))}
           {!loading && !articles.length ? <div className="article-list-empty">没有找到 Markdown 文章</div> : null}
         </nav>
@@ -189,18 +311,14 @@ export function ArticlesModule({ onUnauthorized }: { onUnauthorized: () => void 
       </article>
 
       <aside className="article-chat">
-        <div className="article-scope-tabs">
-          <button className={scope === 'article' ? 'is-active' : ''} onClick={() => setScope('article')} disabled={!current}>当前文章</button>
-          <button className={scope === 'articles' ? 'is-active' : ''} onClick={() => setScope('articles')}>整个项目</button>
-        </div>
         <ChatWorkspace
           compact
-          enabled={scope === 'articles' || Boolean(current)}
-          scope={scope}
+          enabled={Boolean(current)}
+          scope="article"
           sourceId={current?.sourceId}
-          articlePath={scope === 'article' ? current?.path : null}
-          title={scope === 'article' ? current?.title || '文章审核' : '文章项目对话'}
-          subtitle={scope === 'article' ? '独立永久上下文' : '跨文章永久上下文'}
+          articlePath={current?.path}
+          title={current?.title || '文章审核'}
+          subtitle="独立永久上下文"
           onUnauthorized={onUnauthorized}
         />
       </aside>
