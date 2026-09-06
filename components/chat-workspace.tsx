@@ -156,6 +156,8 @@ function QuickPhrases({ onUse }: { onUse: (text: string) => void }) {
 export function ChatWorkspace(props: ChatWorkspaceProps) {
   const chat = useChat(props);
   const [draft, setDraft] = useState('');
+  const draftStorageKey = `mainworker:composer-draft:${props.scope}:${props.sourceId || ''}:${props.articlePath || ''}`;
+  const draftRef = useRef('');
   const [deletingId, setDeletingId] = useState<number | null>(null);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -164,6 +166,28 @@ export function ChatWorkspace(props: ChatWorkspaceProps) {
   const lastScrollTop = useRef(0);
   const quickMode = props.scope === 'workspace' && chat.currentMode === 'quick';
   const newSession = props.scope === 'workspace' && !chat.currentSession && !chat.missingSessionId;
+
+  useEffect(() => {
+    let restoredDraft = '';
+    try {
+      restoredDraft = localStorage.getItem(draftStorageKey) || '';
+    } catch {
+      // Draft persistence is optional when storage is unavailable.
+    }
+    draftRef.current = restoredDraft;
+    queueMicrotask(() => setDraft(restoredDraft));
+  }, [draftStorageKey]);
+
+  function updateDraft(value: string) {
+    draftRef.current = value;
+    setDraft(value);
+    try {
+      if (value) localStorage.setItem(draftStorageKey, value);
+      else localStorage.removeItem(draftStorageKey);
+    } catch {
+      // Keep the in-memory draft usable when storage is unavailable.
+    }
+  }
 
   useEffect(() => {
     if (props.compact) return;
@@ -230,12 +254,12 @@ export function ChatWorkspace(props: ChatWorkspaceProps) {
     if (!message) return;
     followLatest.current = true;
     setShowScrollToBottom(false);
-    setDraft('');
+    updateDraft('');
     void chat.send(message);
   }
 
   function startNewSession(mode: ChatMode = 'work', clearDraft = true) {
-    if (clearDraft) setDraft('');
+    if (clearDraft) updateDraft('');
     followLatest.current = true;
     setShowScrollToBottom(false);
     void chat.startNewSession(mode);
@@ -367,8 +391,8 @@ export function ChatWorkspace(props: ChatWorkspaceProps) {
         <div className="composer-wrap">
           {!props.compact && props.scope === 'workspace' && <ConversationModeSwitch mode={chat.currentMode} onChange={(mode) => startNewSession(mode, false)} />}
           <form className="composer" onSubmit={(event) => { event.preventDefault(); sendDraft(); }}>
-            <Textarea value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); sendDraft(); } }} disabled={chat.sending || Boolean(chat.missingSessionId)} aria-label="发送消息" placeholder={chat.missingSessionId ? '请先打开一个新对话' : chat.sending ? 'Codex 正在处理当前任务…' : quickMode ? '输入一个问题，需要时会联网搜索…' : '交给 Codex 处理…'} rows={3} />
-            <div className="composer-footer"><QuickPhrases onUse={(text) => setDraft((current) => current ? `${current}\n${text}` : text)} />{modelControls}<span className="shortcut"><kbd>Enter</kbd> 发送 · <kbd>Shift</kbd><kbd>Enter</kbd> 换行</span><Button type="submit" size="icon-lg" disabled={!draft.trim() || chat.sending || Boolean(chat.missingSessionId)} aria-label="发送"><Send /></Button></div>
+            <Textarea value={draft} onChange={(event) => updateDraft(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); sendDraft(); } }} disabled={chat.sending || Boolean(chat.missingSessionId)} aria-label="发送消息" placeholder={chat.missingSessionId ? '请先打开一个新对话' : chat.sending ? 'Codex 正在处理当前任务…' : quickMode ? '输入一个问题，需要时会联网搜索…' : '交给 Codex 处理…'} rows={3} />
+            <div className="composer-footer"><QuickPhrases onUse={(text) => updateDraft(draftRef.current ? `${draftRef.current}\n${text}` : text)} />{modelControls}<span className="shortcut"><kbd>Enter</kbd> 发送 · <kbd>Shift</kbd><kbd>Enter</kbd> 换行</span><Button type="submit" size="icon-lg" disabled={!draft.trim() || chat.sending || Boolean(chat.missingSessionId)} aria-label="发送"><Send /></Button></div>
           </form>
           {!props.compact && <p className={`composer-note ${quickMode ? 'is-quick' : ''}`}>{quickMode ? '快速问答不会执行本地命令或修改文件' : 'Codex 可以读取和修改当前工作目录中的文件'}</p>}
         </div>

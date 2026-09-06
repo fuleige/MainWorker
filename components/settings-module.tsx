@@ -1,8 +1,10 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Bot, Database, Gauge, LoaderCircle, LogOut, RefreshCw, Save, ShieldCheck, SlidersHorizontal, TriangleAlert } from 'lucide-react';
+import { Bot, Database, Gauge, LoaderCircle, LogOut, PackageCheck, RefreshCw, Save, ShieldCheck, SlidersHorizontal, TriangleAlert } from 'lucide-react';
+import packageMetadata from '@/package.json';
 import { ChatModel } from '@/hooks/use-chat';
+import { IOS_CHROME_LAST_RELOAD_AT_KEY, IOS_CHROME_RELOAD_COUNT_KEY } from '@/hooks/use-ios-chrome-restoration-reload';
 import { LimitsModule } from '@/components/limits-module';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -88,6 +90,7 @@ export function SettingsModule({ section, onNavigate, onUnauthorized, onLogout }
   const [saving, setSaving] = useState<'chat' | 'codex' | 'refresh' | null>(null);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  const [iosChromeReload, setIOSChromeReload] = useState<{ count: number; lastAt: string | null }>({ count: 0, lastAt: null });
   const settingsLoadStarted = useRef(false);
   const settingsLoadInFlight = useRef(false);
 
@@ -117,6 +120,20 @@ export function SettingsModule({ section, onNavigate, onUnauthorized, onLogout }
   useEffect(() => {
     if ((section === 'chat' || section === 'models') && !payload && !settingsLoadStarted.current) queueMicrotask(() => void load());
   }, [load, payload, section]);
+
+  useEffect(() => {
+    if (section !== 'security') return;
+    let count = 0;
+    let lastAt: string | null = null;
+    try {
+      count = Number(localStorage.getItem(IOS_CHROME_RELOAD_COUNT_KEY)) || 0;
+      const timestamp = Number(localStorage.getItem(IOS_CHROME_LAST_RELOAD_AT_KEY));
+      if (timestamp > 0) lastAt = new Date(timestamp).toISOString();
+    } catch {
+      // Recovery status is optional when storage is unavailable.
+    }
+    queueMicrotask(() => setIOSChromeReload({ count, lastAt }));
+  }, [section]);
 
   async function saveChatDefaults() {
     if (!chatDefaults || saving) return;
@@ -234,6 +251,7 @@ export function SettingsModule({ section, onNavigate, onUnauthorized, onLogout }
           <div className="settings-page">
             <header className="settings-page-header"><div><p className="overline">SECURITY</p><h2>安全</h2><p>当前服务使用单用户 Token 鉴权，凭据只保留在运行 MainWorker 的电脑上。</p></div></header>
             <div className="settings-card"><ShieldCheck /><div><strong>访问已受保护</strong><p>登录状态保存在安全 Cookie 中；直接访问收藏的工具或会话地址时，登录后会留在原地址。</p></div></div>
+            <div className="settings-card settings-version-card"><PackageCheck /><div><strong>版本信息</strong><p>MainWorker <Badge variant="secondary">v{packageMetadata.version}</Badge> · 可用于确认当前生产界面是否已经更新。</p><p>iOS Chrome 历史页恢复：{iosChromeReload.count > 0 ? `已重载 ${iosChromeReload.count} 次，最近 ${dateTime(iosChromeReload.lastAt, true)}` : '尚未触发'}</p></div></div>
             <div className="settings-actions"><Button variant="destructive" onClick={onLogout}><LogOut />退出登录</Button></div>
           </div>
         ) : null}

@@ -45,7 +45,7 @@ export class CodexAppServerClient extends EventEmitter {
     this.lines = readline.createInterface({ input: this.child.stdout });
     this.lines.on('line', (line) => this.#handleLine(line));
     await this.#requestRaw('initialize', {
-      clientInfo: { name: 'mainworker_web', title: 'MainWorker Web', version: '0.1.1' },
+      clientInfo: { name: 'mainworker_web', title: 'MainWorker Web', version: '0.1.9' },
       capabilities: {},
     });
     this.notify('initialized', {});

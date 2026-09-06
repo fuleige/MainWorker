@@ -10,6 +10,7 @@ import { ToolWorkbench } from '@/components/tool-workbench';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
+import { useIOSChromeRestorationReload } from '@/hooks/use-ios-chrome-restoration-reload';
 
 type ViewId = 'chat' | 'workbench' | 'articles' | 'planner' | 'settings';
 type AppRoute = { view: ViewId; sessionId: number | null; settingsSection: SettingsSection };
@@ -84,6 +85,7 @@ function storeChatHref(href: string) {
 }
 
 export function WorkbenchApp() {
+  useIOSChromeRestorationReload();
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
   const [token, setToken] = useState('');
   const [loginError, setLoginError] = useState('');

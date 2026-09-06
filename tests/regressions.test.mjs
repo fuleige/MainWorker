@@ -153,6 +153,38 @@ test('chat layout keeps the composer fixed while messages scroll independently',
   assert.match(css, /@media \(max-width:\s*720px\)[\s\S]*?\.composer textarea\s*\{[^}]*max-height:\s*min\(25dvh,\s*150px\);/s);
 });
 
+test('iOS Chrome reloads compositor-broken history restorations without changing the mobile layout', () => {
+  const recovery = fs.readFileSync(path.join(projectRoot, 'hooks/use-ios-chrome-restoration-reload.ts'), 'utf8');
+  const layout = fs.readFileSync(path.join(projectRoot, 'app/layout.tsx'), 'utf8');
+  const app = fs.readFileSync(path.join(projectRoot, 'components/workbench-app.tsx'), 'utf8');
+  const chat = fs.readFileSync(path.join(projectRoot, 'components/chat-workspace.tsx'), 'utf8');
+  const css = fs.readFileSync(path.join(projectRoot, 'app/globals.css'), 'utf8');
+  const server = fs.readFileSync(path.join(projectRoot, 'server/index.js'), 'utf8');
+
+  assert.match(recovery, /CriOS\\\//);
+  assert.match(recovery, /navigationType\(\) !== 'back_forward'/);
+  assert.match(recovery, /event\.persisted/);
+  assert.match(recovery, /history\.scrollRestoration = 'manual'/);
+  assert.match(recovery, /window\.location\.reload\(\)/);
+  assert.match(recovery, /ios-chrome-restoration-reload-guard/);
+  assert.match(recovery, /const RELOAD_DELAY_MS = 120/);
+  assert.match(layout, /entry\?\.type === 'back_forward'/);
+  assert.match(layout, /data-ios-chrome-restoring/);
+  assert.match(layout, /正在恢复页面…/);
+  assert.match(layout, /setTimeout\(\(\) => location\.reload\(\), 120\)/);
+  assert.match(layout, /html\[data-ios-chrome-restoring="true"\] body \{ opacity: 0 !important; \}/);
+  assert.match(layout, /removeAttribute\('data-ios-chrome-restoring'\), 4000/);
+  assert.match(app, /useIOSChromeRestorationReload\(\)/);
+  assert.doesNotMatch(server, /\/api\/client-diagnostics|\[ios-viewport\]/);
+  assert.doesNotMatch(recovery, /style\.transform/);
+  assert.match(chat, /mainworker:composer-draft/);
+  assert.match(chat, /localStorage\.setItem\(draftStorageKey, value\)/);
+  assert.match(chat, /localStorage\.getItem\(draftStorageKey\)/);
+  assert.match(css, /@media \(max-width:\s*720px\)[\s\S]*?\.workbench-shell\s*\{\s*display:\s*block;\s*padding-bottom:\s*62px;\s*\}/);
+  assert.match(css, /@media \(max-width:\s*720px\)[\s\S]*?\.mobile-tabs\s*\{[^}]*position:\s*fixed;[^}]*bottom:\s*0;/s);
+  assert.doesNotMatch(css, /ios-viewport-offset-top/);
+});
+
 test('article columns have independent bounded scroll containers', () => {
   const css = fs.readFileSync(path.join(projectRoot, 'app/globals.css'), 'utf8');
   assert.match(css, /\.articles-module\s*\{[^}]*min-height:\s*0;[^}]*overflow:\s*hidden;/s);
