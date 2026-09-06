@@ -67,6 +67,12 @@ export class WorkbenchDatabase {
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
 
+      CREATE TABLE IF NOT EXISTS app_settings (
+        setting_key TEXT PRIMARY KEY,
+        value_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+
       CREATE TABLE IF NOT EXISTS article_activity (
         article_path TEXT PRIMARY KEY,
         last_opened_at TEXT NOT NULL
@@ -198,6 +204,24 @@ export class WorkbenchDatabase {
 
   deleteQuickPhrase(id) {
     return this.database.prepare('DELETE FROM quick_phrases WHERE id = ?').run(id).changes > 0;
+  }
+
+  readSetting(key) {
+    const row = this.database.prepare('SELECT value_json FROM app_settings WHERE setting_key = ?').get(key);
+    if (!row) return null;
+    try {
+      return JSON.parse(row.value_json);
+    } catch {
+      return null;
+    }
+  }
+
+  writeSetting(key, value) {
+    this.database.prepare(`
+      INSERT INTO app_settings(setting_key, value_json) VALUES (?, ?)
+      ON CONFLICT(setting_key) DO UPDATE SET value_json = excluded.value_json, updated_at = CURRENT_TIMESTAMP
+    `).run(key, JSON.stringify(value));
+    return this.readSetting(key);
   }
 
   markArticleOpened(articlePath, openedAt = new Date().toISOString()) {

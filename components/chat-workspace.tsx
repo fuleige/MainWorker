@@ -49,6 +49,8 @@ type ChatWorkspaceProps = {
   compact?: boolean;
   enabled?: boolean;
   onUnauthorized?: () => void;
+  sessionId?: number | null;
+  onSessionUrlChange?: (sessionId: number | null, historyMode: 'push' | 'replace') => void;
 };
 
 function SessionList({
@@ -161,7 +163,7 @@ export function ChatWorkspace(props: ChatWorkspaceProps) {
   const followLatest = useRef(true);
   const lastScrollTop = useRef(0);
   const quickMode = props.scope === 'workspace' && chat.currentMode === 'quick';
-  const newSession = props.scope === 'workspace' && !chat.currentSession;
+  const newSession = props.scope === 'workspace' && !chat.currentSession && !chat.missingSessionId;
 
   useEffect(() => {
     if (props.compact) return;
@@ -184,6 +186,15 @@ export function ChatWorkspace(props: ChatWorkspaceProps) {
     const frame = requestAnimationFrame(() => setShowScrollToBottom(false));
     return () => cancelAnimationFrame(frame);
   }, [chat.currentSession?.id]);
+
+  useEffect(() => {
+    if (props.scope !== 'workspace') return;
+    document.title = chat.missingSessionId
+      ? '会话不可用 · MainWorker'
+      : chat.currentSession
+        ? `${chat.currentSession.title} · MainWorker`
+        : '新对话 · MainWorker';
+  }, [chat.currentSession, chat.missingSessionId, props.scope]);
 
   function handleMessageScroll() {
     const stage = messageStage.current;
@@ -330,7 +341,10 @@ export function ChatWorkspace(props: ChatWorkspaceProps) {
             <div className="message-thread">
               {chat.error && <div className="chat-inline-error" role="alert">{chat.error}</div>}
               {chat.loading ? <div className="chat-empty"><LoaderCircle className="spin" /><p>正在恢复永久会话…</p></div> : null}
-              {!chat.loading && !chat.messages.length ? (
+              {!chat.loading && chat.missingSessionId ? (
+                <div className="chat-empty is-missing-session"><span><MessageSquareText /></span><h3>会话不可用</h3><p>会话 {chat.missingSessionId} 不存在或已经被删除。地址没有被改成新会话，以免掩盖问题。</p><Button variant="outline" onClick={() => startNewSession()}><Plus />打开新对话</Button></div>
+              ) : null}
+              {!chat.loading && !chat.missingSessionId && !chat.messages.length ? (
                 <div className={`chat-empty ${quickMode ? 'is-quick' : ''}`}><span>{quickMode ? <Globe2 /> : <MessageSquareText />}</span><h3>{newSession ? '新会话' : quickMode ? '直接问我' : '从这里开始'}</h3><p>{quickMode ? '适合简单问题；需要最新信息时会自动联网搜索。' : props.scope === 'article' ? '让 Codex 审核、改写或直接修改当前文章。' : props.scope === 'articles' ? '从整个文章库范围整理、检查和规划内容。' : '选择模式后直接输入；发送第一条消息时才会保存这个会话。'}</p></div>
               ) : null}
               {chat.messages.map((message) => (
@@ -353,8 +367,8 @@ export function ChatWorkspace(props: ChatWorkspaceProps) {
         <div className="composer-wrap">
           {!props.compact && props.scope === 'workspace' && <ConversationModeSwitch mode={chat.currentMode} onChange={(mode) => startNewSession(mode, false)} />}
           <form className="composer" onSubmit={(event) => { event.preventDefault(); sendDraft(); }}>
-            <Textarea value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); sendDraft(); } }} disabled={chat.sending} aria-label="发送消息" placeholder={chat.sending ? 'Codex 正在处理当前任务…' : quickMode ? '输入一个问题，需要时会联网搜索…' : '交给 Codex 处理…'} rows={3} />
-            <div className="composer-footer"><QuickPhrases onUse={(text) => setDraft((current) => current ? `${current}\n${text}` : text)} />{modelControls}<span className="shortcut"><kbd>Enter</kbd> 发送 · <kbd>Shift</kbd><kbd>Enter</kbd> 换行</span><Button type="submit" size="icon-lg" disabled={!draft.trim() || chat.sending} aria-label="发送"><Send /></Button></div>
+            <Textarea value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); sendDraft(); } }} disabled={chat.sending || Boolean(chat.missingSessionId)} aria-label="发送消息" placeholder={chat.missingSessionId ? '请先打开一个新对话' : chat.sending ? 'Codex 正在处理当前任务…' : quickMode ? '输入一个问题，需要时会联网搜索…' : '交给 Codex 处理…'} rows={3} />
+            <div className="composer-footer"><QuickPhrases onUse={(text) => setDraft((current) => current ? `${current}\n${text}` : text)} />{modelControls}<span className="shortcut"><kbd>Enter</kbd> 发送 · <kbd>Shift</kbd><kbd>Enter</kbd> 换行</span><Button type="submit" size="icon-lg" disabled={!draft.trim() || chat.sending || Boolean(chat.missingSessionId)} aria-label="发送"><Send /></Button></div>
           </form>
           {!props.compact && <p className={`composer-note ${quickMode ? 'is-quick' : ''}`}>{quickMode ? '快速问答不会执行本地命令或修改文件' : 'Codex 可以读取和修改当前工作目录中的文件'}</p>}
         </div>

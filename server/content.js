@@ -107,9 +107,9 @@ export async function renderMarkdown(projectRoot, articlePath, source, sourceId 
         const resolved = path.resolve(path.dirname(path.resolve(projectRoot, articlePath)), decodeURIComponent(pathname));
         if (isInside(projectRoot, resolved) && resolved.toLowerCase().endsWith('.md')) {
           const relative = path.relative(projectRoot, resolved).split(path.sep).join('/');
-          const sourceParam = sourceId ? `&source=${encodeURIComponent(sourceId)}` : '';
+          const sourceParam = sourceId ? `source=${encodeURIComponent(sourceId)}&` : '';
           const hash = fragment ? `#${fragment}` : '';
-          token.href = `/?module=articles${sourceParam}&article=${encodeURIComponent(relative)}${hash}`;
+          token.href = `/tools/articles?${sourceParam}article=${encodeURIComponent(relative)}${hash}`;
         }
       }
     },

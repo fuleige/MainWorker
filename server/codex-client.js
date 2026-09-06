@@ -143,7 +143,7 @@ export class CodexAppServerClient extends EventEmitter {
         ].join(' '),
         config: {
           web_search: 'live',
-          model_reasoning_effort: reasoningEffort || 'low',
+          model_reasoning_effort: reasoningEffort || 'medium',
           tools: {
             web_search: { context_size: 'low' },
             view_image: false,
@@ -225,6 +225,13 @@ export class CodexAppServerClient extends EventEmitter {
 
   readConfig(cwd) {
     return this.request('config/read', { cwd, includeLayers: false }, cwd);
+  }
+
+  writeConfig(edits, cwd) {
+    return this.request('config/batchWrite', {
+      cwd,
+      edits: edits.map((edit) => ({ ...edit, mergeStrategy: edit.mergeStrategy || 'upsert' })),
+    }, cwd);
   }
 
   interruptTurn(threadId, turnId, cwd) {

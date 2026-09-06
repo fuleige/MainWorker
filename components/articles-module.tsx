@@ -20,6 +20,15 @@ type ArticleSummary = {
 };
 
 type Article = ArticleSummary & { html: string; source: string };
+type ArticleSync = {
+  lastAttemptAt: number | null;
+  lastSuccessAt: number | null;
+  nextAt: number | null;
+  status: 'scheduled' | 'checking' | 'paused' | 'error';
+  error: string;
+};
+
+const ARTICLE_CHECK_INTERVAL_MS = 30_000;
 
 type ArticleTreeGroup = {
   key: string;
@@ -137,6 +146,11 @@ function decodeAnchor(value: string) {
   }
 }
 
+function clockTime(value: number | null) {
+  if (!value) return '尚未检查';
+  return new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(new Date(value));
+}
+
 export function ArticlesModule({ onUnauthorized }: { onUnauthorized: () => void }) {
   const [articles, setArticles] = useState<ArticleSummary[]>([]);
   const [current, setCurrent] = useState<Article | null>(null);
@@ -149,6 +163,7 @@ export function ArticlesModule({ onUnauthorized }: { onUnauthorized: () => void 
   const articleReader = useRef<HTMLElement>(null);
   const pendingReaderPosition = useRef<{ scrollTop: number; anchor: string } | null>(null);
   const refreshInFlight = useRef(false);
+  const [sync, setSync] = useState<ArticleSync>({ lastAttemptAt: null, lastSuccessAt: null, nextAt: null, status: 'scheduled', error: '' });
   const currentKey = current?.key || null;
   const articleTree = useMemo(() => buildArticleTree(articles), [articles]);
 
@@ -167,10 +182,10 @@ export function ArticlesModule({ onUnauthorized }: { onUnauthorized: () => void 
       setError('');
       if (markOpened) {
         const params = new URLSearchParams(location.search);
-        params.set('module', 'articles');
+        params.delete('module');
         params.set('source', payload.sourceId);
         params.set('article', payload.path);
-        history.replaceState(null, '', `/?${params}${normalizedAnchor ? `#${encodeURIComponent(normalizedAnchor)}` : ''}`);
+        history.replaceState(null, '', `/tools/articles?${params}${normalizedAnchor ? `#${encodeURIComponent(normalizedAnchor)}` : ''}`);
         setMobilePane('reader');
       }
     } catch (error) {
@@ -217,20 +232,51 @@ export function ArticlesModule({ onUnauthorized }: { onUnauthorized: () => void 
   useEffect(() => { queueMicrotask(() => void loadArticles()); }, [loadArticles]);
   useEffect(() => () => { if (searchTimer.current) clearTimeout(searchTimer.current); }, []);
   useEffect(() => {
+    if (!current) return;
     let cancelled = false;
-    const interval = setInterval(async () => {
-      if (document.visibilityState !== 'visible' || !current || refreshInFlight.current) return;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const schedule = () => {
+      if (timer) clearTimeout(timer);
+      if (document.visibilityState !== 'visible') {
+        setSync((value) => ({ ...value, nextAt: null, status: 'paused' }));
+        return;
+      }
+      const nextAt = Date.now() + ARTICLE_CHECK_INTERVAL_MS;
+      setSync((value) => ({ ...value, nextAt, status: value.status === 'error' ? 'error' : 'scheduled' }));
+      timer = setTimeout(() => void check(), ARTICLE_CHECK_INTERVAL_MS);
+    };
+
+    const check = async () => {
+      if (cancelled || document.visibilityState !== 'visible' || refreshInFlight.current) return schedule();
       refreshInFlight.current = true;
+      const attemptedAt = Date.now();
+      setSync((value) => ({ ...value, lastAttemptAt: attemptedAt, nextAt: null, status: 'checking', error: '' }));
       try {
         const status = await api<{ updatedAt: string }>(`/api/article/status?source=${encodeURIComponent(current.sourceId)}&path=${encodeURIComponent(current.path)}`);
         if (!cancelled && status.updatedAt !== current.updatedAt) await openArticle(current.sourceId, current.path, false);
+        if (!cancelled) setSync((value) => ({ ...value, lastSuccessAt: Date.now(), status: 'scheduled', error: '' }));
       } catch (error) {
         if ((error as { status?: number }).status === 401) onUnauthorized();
+        if (!cancelled) setSync((value) => ({ ...value, status: 'error', error: error instanceof Error ? error.message : '检查失败' }));
       } finally {
         refreshInFlight.current = false;
+        if (!cancelled) schedule();
       }
-    }, 5000);
-    return () => { cancelled = true; clearInterval(interval); };
+    };
+
+    const onVisibilityChange = () => schedule();
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setSync({ lastAttemptAt: null, lastSuccessAt: Date.now(), nextAt: null, status: document.visibilityState === 'visible' ? 'scheduled' : 'paused', error: '' });
+      schedule();
+    });
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
   }, [current, onUnauthorized, openArticle]);
 
   const navigateArticleLink = useCallback((event: MouseEvent) => {
@@ -241,7 +287,8 @@ export function ArticlesModule({ onUnauthorized }: { onUnauthorized: () => void 
     if (!(link instanceof HTMLAnchorElement) || link.target || link.getAttribute('href')?.startsWith('#')) return;
     const url = new URL(link.href, location.href);
     const articlePath = url.searchParams.get('article');
-    if (url.origin !== location.origin || url.searchParams.get('module') !== 'articles' || !articlePath) return;
+    const articleRoute = url.pathname === '/tools/articles' || url.searchParams.get('module') === 'articles';
+    if (url.origin !== location.origin || !articleRoute || !articlePath) return;
     event.preventDefault();
     void openArticle(url.searchParams.get('source') || current?.sourceId || '', articlePath, true, url.hash);
   }, [current?.sourceId, openArticle]);
@@ -300,6 +347,7 @@ export function ArticlesModule({ onUnauthorized }: { onUnauthorized: () => void 
       <article className="article-reader" ref={articleReader}>
         <header className="article-reader-bar">
           {current && <span>{current.characters.toLocaleString('zh-CN')} 字符 · {new Date(current.updatedAt).toLocaleDateString('zh-CN')}</span>}
+          {current && <span className={`article-sync is-${sync.status}`} title={sync.error || undefined}>{sync.status === 'paused' ? '后台标签页，自动检查已暂停' : sync.status === 'checking' ? '正在检查更新…' : sync.status === 'error' ? `上次检查 ${clockTime(sync.lastAttemptAt)} · 检查失败 · 下次检查 ${clockTime(sync.nextAt)}` : `上次检查 ${clockTime(sync.lastAttemptAt)} · 下次检查 ${clockTime(sync.nextAt)}`}</span>}
         </header>
         {current ? (
           <div className="article-document">

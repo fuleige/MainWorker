@@ -274,6 +274,7 @@ export function LimitsModule({ onUnauthorized }: { onUnauthorized: () => void })
         <>
           <div className="limits-summary">
             <div><span className="limits-summary-icon warm"><Clock3 /></span><p>上次更新<strong>{dateTime(payload.fetchedAt)}</strong></p></div>
+            <div><span className="limits-summary-icon green"><RefreshCw /></span><p>缓存有效至<strong>{cacheExpired ? '已过期，等待下次使用刷新' : dateTime(payload.nextRefreshAt)}</strong></p></div>
             {payload.resetCreditsCount != null ? (
               <div className="reset-credit-summary" title="当前账户可用于恢复 Codex 额度窗口的重置权益">
                 <span className="limits-summary-icon credit"><RefreshCw /></span>

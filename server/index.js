@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import http from 'node:http';
+import https from 'node:https';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createAuth } from './auth.js';
@@ -35,6 +36,12 @@ const articleSources = [{
 }];
 const host = process.env.API_HOST || '127.0.0.1';
 const port = Number(process.env.API_PORT || 4390);
+const tlsCertFile = process.env.TLS_CERT_FILE?.trim();
+const tlsKeyFile = process.env.TLS_KEY_FILE?.trim();
+if (Boolean(tlsCertFile) !== Boolean(tlsKeyFile)) {
+  throw new Error('启用 HTTPS 时必须同时设置 TLS_CERT_FILE 和 TLS_KEY_FILE');
+}
+const tlsEnabled = Boolean(tlsCertFile && tlsKeyFile);
 const auth = createAuth(dataRoot);
 const database = new WorkbenchDatabase(dataRoot);
 const content = new ContentRepository(articleSources);
@@ -47,9 +54,16 @@ const activeRunsById = new Map();
 const loginAttempts = new Map();
 const LOGIN_WINDOW_MS = 10 * 60 * 1000;
 const LOGIN_ATTEMPT_LIMIT = 6;
-const MODEL_CATALOG_TTL_MS = 5 * 60 * 1000;
+const MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
+const CHAT_DEFAULTS_SETTING_KEY = 'chat.defaults';
 const REPLAYABLE_EVENTS = new Set(['run', 'meta', 'activity', 'reasoning', 'plan', 'metrics', 'error']);
-let modelCatalogCache = { fetchedAt: 0, catalog: null };
+let modelCatalogCache = {
+  fetchedAt: 0,
+  lastAttemptAt: 0,
+  lastSuccessAt: 0,
+  lastError: null,
+  catalog: null,
+};
 let modelCatalogPromise = null;
 
 codex.on('event', (message) => {
@@ -68,6 +82,7 @@ function securityHeaders(response) {
   response.setHeader('X-Frame-Options', 'DENY');
   response.setHeader('Referrer-Policy', 'no-referrer');
   response.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+  if (tlsEnabled) response.setHeader('Strict-Transport-Security', 'max-age=31536000');
 }
 
 function sendJson(response, status, payload) {
@@ -182,26 +197,58 @@ function publicModel(model) {
   };
 }
 
-async function readModelCatalog() {
+function modelCatalogMetadata() {
   const now = Date.now();
-  if (modelCatalogCache.catalog && now - modelCatalogCache.fetchedAt < MODEL_CATALOG_TTL_MS) return modelCatalogCache.catalog;
+  const expiresAt = modelCatalogCache.lastSuccessAt
+    ? modelCatalogCache.lastSuccessAt + MODEL_CATALOG_TTL_MS
+    : 0;
+  return {
+    lastAttemptAt: modelCatalogCache.lastAttemptAt ? new Date(modelCatalogCache.lastAttemptAt).toISOString() : null,
+    lastSuccessAt: modelCatalogCache.lastSuccessAt ? new Date(modelCatalogCache.lastSuccessAt).toISOString() : null,
+    cacheExpiresAt: expiresAt ? new Date(expiresAt).toISOString() : null,
+    nextScheduledAt: null,
+    refreshAllowedAt: null,
+    status: modelCatalogCache.lastError ? 'error' : expiresAt > now ? 'fresh' : modelCatalogCache.catalog ? 'stale' : 'empty',
+    source: 'Codex App Server',
+    error: modelCatalogCache.lastError,
+    policy: { cacheTtlMs: MODEL_CATALOG_TTL_MS, polling: false },
+  };
+}
+
+async function readModelCatalog({ force = false } = {}) {
+  const now = Date.now();
+  if (!force && modelCatalogCache.catalog && now - modelCatalogCache.fetchedAt < MODEL_CATALOG_TTL_MS) return modelCatalogCache.catalog;
   if (modelCatalogPromise) return modelCatalogPromise;
   modelCatalogPromise = (async () => {
-    const [models, configResult] = await Promise.all([codex.listModels(projectRoot), codex.readConfig(projectRoot)]);
-    const configuredModel = configResult.config?.model;
-    const defaultModel = models.find((model) => model.model === configuredModel || model.id === configuredModel)
-      || models.find((model) => model.isDefault)
-      || models[0];
-    if (!defaultModel) throw new Error('Codex 没有返回可用模型');
-    const configuredEffort = configResult.config?.model_reasoning_effort;
-    const supportsConfiguredEffort = defaultModel.supportedReasoningEfforts?.some((option) => option.reasoningEffort === configuredEffort);
-    const catalog = {
-      models,
-      defaultModel: defaultModel.model,
-      defaultReasoningEffort: supportsConfiguredEffort ? configuredEffort : defaultModel.defaultReasoningEffort,
-    };
-    modelCatalogCache = { fetchedAt: Date.now(), catalog };
-    return catalog;
+    modelCatalogCache.lastAttemptAt = Date.now();
+    try {
+      const [models, configResult] = await Promise.all([codex.listModels(projectRoot), codex.readConfig(projectRoot)]);
+      const configuredModel = configResult.config?.model;
+      const defaultModel = models.find((model) => model.model === configuredModel || model.id === configuredModel)
+        || models.find((model) => model.isDefault)
+        || models[0];
+      if (!defaultModel) throw new Error('Codex 没有返回可用模型');
+      const configuredEffort = configResult.config?.model_reasoning_effort;
+      const supportsConfiguredEffort = defaultModel.supportedReasoningEfforts?.some((option) => option.reasoningEffort === configuredEffort);
+      const catalog = {
+        models,
+        defaultModel: defaultModel.model,
+        defaultReasoningEffort: supportsConfiguredEffort ? configuredEffort : defaultModel.defaultReasoningEffort,
+      };
+      const completedAt = Date.now();
+      modelCatalogCache = {
+        fetchedAt: completedAt,
+        lastAttemptAt: modelCatalogCache.lastAttemptAt,
+        lastSuccessAt: completedAt,
+        lastError: null,
+        catalog,
+      };
+      return catalog;
+    } catch (error) {
+      modelCatalogCache.lastError = error instanceof Error ? error.message : '模型目录刷新失败';
+      if (modelCatalogCache.catalog) return modelCatalogCache.catalog;
+      throw error;
+    }
   })();
   try {
     return await modelCatalogPromise;
@@ -210,10 +257,69 @@ async function readModelCatalog() {
   }
 }
 
+function modelById(catalog, modelId) {
+  return catalog.models.find((entry) => entry.model === modelId || entry.id === modelId) || null;
+}
+
+function fallbackModeDefault(mode, catalog) {
+  const model = modelById(catalog, catalog.defaultModel) || catalog.models[0];
+  if (!model) throw new Error('Codex 没有返回可用模型');
+  const efforts = model.supportedReasoningEfforts || [];
+  const preferredEffort = mode === 'quick' && efforts.some((option) => option.reasoningEffort === 'medium')
+    ? 'medium'
+    : catalog.defaultReasoningEffort;
+  const reasoningEffort = efforts.some((option) => option.reasoningEffort === preferredEffort)
+    ? preferredEffort
+    : model.defaultReasoningEffort || efforts[0]?.reasoningEffort || 'medium';
+  return { model: model.model, reasoningEffort };
+}
+
+function normalizeModeDefault(value, mode, catalog) {
+  const fallback = fallbackModeDefault(mode, catalog);
+  if (!value || typeof value !== 'object') return fallback;
+  const model = modelById(catalog, value.model);
+  if (!model) return fallback;
+  const reasoningEffort = String(value.reasoningEffort || '');
+  if (!(model.supportedReasoningEfforts || []).some((option) => option.reasoningEffort === reasoningEffort)) return fallback;
+  return { model: model.model, reasoningEffort };
+}
+
+function readChatDefaults(catalog) {
+  const saved = database.readSetting(CHAT_DEFAULTS_SETTING_KEY);
+  return {
+    work: normalizeModeDefault(saved?.work, 'work', catalog),
+    quick: normalizeModeDefault(saved?.quick, 'quick', catalog),
+  };
+}
+
+function validateModeDefault(value, mode, catalog) {
+  if (!value || typeof value !== 'object') throw new Error(`${mode === 'quick' ? '快速问答' : '工作对话'}默认值无效`);
+  const model = modelById(catalog, String(value.model || ''));
+  if (!model) throw new Error(`${mode === 'quick' ? '快速问答' : '工作对话'}所选模型不可用`);
+  const reasoningEffort = String(value.reasoningEffort || '');
+  if (!(model.supportedReasoningEfforts || []).some((option) => option.reasoningEffort === reasoningEffort)) {
+    throw new Error(`${model.displayName || model.model} 不支持所选推理强度`);
+  }
+  return { model: model.model, reasoningEffort };
+}
+
+function publicModelCatalog(catalog) {
+  const defaults = readChatDefaults(catalog);
+  return {
+    models: catalog.models.map(publicModel),
+    defaultModel: defaults.work.model,
+    defaultReasoningEffort: defaults.work.reasoningEffort,
+    modeDefaults: defaults,
+    codexDefaults: { model: catalog.defaultModel, reasoningEffort: catalog.defaultReasoningEffort },
+    refresh: modelCatalogMetadata(),
+  };
+}
+
 function defaultEffortFor(mode, model, catalog) {
-  if (mode === 'quick' && model.supportedReasoningEfforts?.some((option) => option.reasoningEffort === 'low')) return 'low';
-  if (model.model === catalog.defaultModel && model.supportedReasoningEfforts?.some((option) => option.reasoningEffort === catalog.defaultReasoningEffort)) {
-    return catalog.defaultReasoningEffort;
+  const defaults = readChatDefaults(catalog);
+  const modeDefault = mode === 'quick' ? defaults.quick : defaults.work;
+  if (model.model === modeDefault.model && model.supportedReasoningEfforts?.some((option) => option.reasoningEffort === modeDefault.reasoningEffort)) {
+    return modeDefault.reasoningEffort;
   }
   return model.defaultReasoningEffort || model.supportedReasoningEfforts?.[0]?.reasoningEffort || 'medium';
 }
@@ -221,8 +327,9 @@ function defaultEffortFor(mode, model, catalog) {
 async function ensureConcreteSessionSettings(session) {
   if (session.model && session.reasoning_effort) return session;
   const catalog = await readModelCatalog();
+  const modeDefault = readChatDefaults(catalog)[session.mode === 'quick' ? 'quick' : 'work'];
   const model = catalog.models.find((entry) => entry.model === session.model || entry.id === session.model)
-    || catalog.models.find((entry) => entry.model === catalog.defaultModel)
+    || catalog.models.find((entry) => entry.model === modeDefault.model)
     || catalog.models[0];
   const effortSupported = model.supportedReasoningEfforts?.some((option) => option.reasoningEffort === session.reasoning_effort);
   const effort = effortSupported ? session.reasoning_effort : defaultEffortFor(session.mode, model, catalog);
@@ -619,6 +726,57 @@ async function requestHandler(request, response) {
     const opened = url.searchParams.get('opened') === '1' ? database.markArticleOpened(article.key) : database.listArticleActivity().get(article.key) || article.updatedAt;
     return sendJson(response, 200, { ...article, lastOpenedAt: opened });
   }
+  if (request.method === 'GET' && url.pathname === '/api/settings') {
+    const catalog = await readModelCatalog();
+    return sendJson(response, 200, publicModelCatalog(catalog));
+  }
+  if (request.method === 'PATCH' && url.pathname === '/api/settings/chat-defaults') {
+    const body = await readJson(request, 8192);
+    const catalog = await readModelCatalog();
+    let defaults;
+    try {
+      defaults = {
+        work: validateModeDefault(body.work, 'work', catalog),
+        quick: validateModeDefault(body.quick, 'quick', catalog),
+      };
+    } catch (error) {
+      return sendError(response, 400, error.message || '对话默认值无效');
+    }
+    database.writeSetting(CHAT_DEFAULTS_SETTING_KEY, defaults);
+    return sendJson(response, 200, publicModelCatalog(catalog));
+  }
+  if (request.method === 'PATCH' && url.pathname === '/api/settings/codex') {
+    const body = await readJson(request, 4096);
+    const catalog = await readModelCatalog();
+    let selected;
+    try {
+      selected = validateModeDefault(body, 'work', catalog);
+    } catch (error) {
+      return sendError(response, 400, error.message || 'Codex 全局默认值无效');
+    }
+    await codex.writeConfig([
+      { keyPath: 'model', value: selected.model },
+      { keyPath: 'model_reasoning_effort', value: selected.reasoningEffort },
+    ], projectRoot);
+    const completedAt = Date.now();
+    modelCatalogCache = {
+      ...modelCatalogCache,
+      fetchedAt: completedAt,
+      lastAttemptAt: completedAt,
+      lastSuccessAt: completedAt,
+      lastError: null,
+      catalog: {
+        ...catalog,
+        defaultModel: selected.model,
+        defaultReasoningEffort: selected.reasoningEffort,
+      },
+    };
+    return sendJson(response, 200, publicModelCatalog(modelCatalogCache.catalog));
+  }
+  if (request.method === 'POST' && url.pathname === '/api/chat/models/refresh') {
+    const catalog = await readModelCatalog({ force: true });
+    return sendJson(response, 200, publicModelCatalog(catalog));
+  }
   if (request.method === 'GET' && url.pathname === '/api/chat/sessions') {
     const context = resolveChatContext(url.searchParams.get('scope'), url.searchParams.get('article'), url.searchParams.get('source'));
     const sessions = await Promise.all(database.listSessions(context.scope, context.key).map(ensureConcreteSessionSettings));
@@ -633,9 +791,10 @@ async function requestHandler(request, response) {
     const catalog = await readModelCatalog();
     const requestedModel = body.model == null || body.model === '' ? null : String(body.model);
     const requestedEffort = body.reasoningEffort == null || body.reasoningEffort === '' ? null : String(body.reasoningEffort);
+    const modeDefault = readChatDefaults(catalog)[mode];
     const model = requestedModel
       ? catalog.models.find((entry) => entry.model === requestedModel || entry.id === requestedModel)
-      : catalog.models.find((entry) => entry.model === catalog.defaultModel) || catalog.models[0];
+      : catalog.models.find((entry) => entry.model === modeDefault.model) || catalog.models[0];
     if (!model) return sendError(response, requestedModel ? 400 : 503, requestedModel ? '所选模型不可用' : '暂时无法读取可用模型');
     const effort = requestedEffort || defaultEffortFor(mode, model, catalog);
     if (!(model.supportedReasoningEfforts || []).some((option) => option.reasoningEffort === effort)) {
@@ -669,11 +828,7 @@ async function requestHandler(request, response) {
   }
   if (request.method === 'GET' && url.pathname === '/api/chat/models') {
     const catalog = await readModelCatalog();
-    return sendJson(response, 200, {
-      models: catalog.models.map(publicModel),
-      defaultModel: catalog.defaultModel,
-      defaultReasoningEffort: catalog.defaultReasoningEffort,
-    });
+    return sendJson(response, 200, publicModelCatalog(catalog));
   }
   if (request.method === 'DELETE' && url.pathname === '/api/chat/sessions') {
     const body = await readJson(request, 4096);
@@ -777,16 +932,25 @@ async function requestHandler(request, response) {
   sendError(response, 404, '接口不存在');
 }
 
-const server = http.createServer((request, response) => {
+const handleRequest = (request, response) => {
   requestHandler(request, response).catch((error) => {
     console.error(error);
     if (!response.headersSent) sendError(response, 500, error.message || '服务器错误');
     else if (!response.writableEnded) response.end();
   });
-});
+};
+
+const server = tlsEnabled
+  ? https.createServer({
+      cert: fs.readFileSync(tlsCertFile),
+      key: fs.readFileSync(tlsKeyFile),
+      minVersion: 'TLSv1.2',
+    }, handleRequest)
+  : http.createServer(handleRequest);
 
 server.listen(port, host, () => {
-  console.log(`MainWorker API: http://${host}:${port}`);
+  console.log(`MainWorker: ${tlsEnabled ? 'https' : 'http'}://${host}:${port}`);
+  if (tlsEnabled) console.log(`TLS 证书: ${tlsCertFile}`);
   console.log(auth.tokenSource === 'environment' ? '访问口令来源: WORKBENCH_TOKEN' : `访问口令文件: ${auth.tokenFile}`);
 });
 

@@ -62,6 +62,13 @@ test('chat mode and model settings persist with a safe legacy migration', () => 
     assert.equal(restored.mode, 'quick');
     assert.equal(restored.model, 'gpt-5.6-luna');
     assert.equal(restored.reasoning_effort, 'medium');
+
+    const defaults = {
+      work: { model: 'gpt-5.6-sol', reasoningEffort: 'high' },
+      quick: { model: 'gpt-5.6-luna', reasoningEffort: 'medium' },
+    };
+    assert.deepEqual(database.writeSetting('chat.defaults', defaults), defaults);
+    assert.deepEqual(database.readSetting('chat.defaults'), defaults);
   } finally {
     database.database.close();
     fs.rmSync(directory, { recursive: true, force: true });
@@ -84,6 +91,7 @@ test('quick conversations retain web search while disabling local agent tools', 
   assert.equal(options.config.features.unified_exec, false);
   assert.equal(options.config.features.plugins, false);
   assert.equal(options.config.features.multi_agent, false);
+  assert.equal(client.threadOptions(context, { mode: 'quick' }).config.model_reasoning_effort, 'medium');
 
   const calls = [];
   client.request = async (method, params) => {
@@ -96,6 +104,17 @@ test('quick conversations retain web search while disabling local agent tools', 
   assert.deepEqual(turnStart.params.sandboxPolicy, { type: 'readOnly', networkAccess: true });
   assert.equal(turnStart.params.model, 'gpt-5.6-sol');
   assert.equal(turnStart.params.effort, 'low');
+
+  await client.writeConfig([
+    { keyPath: 'model', value: 'gpt-5.6-sol' },
+    { keyPath: 'model_reasoning_effort', value: 'medium', mergeStrategy: 'replace' },
+  ], context.cwd);
+  const configWrite = calls.find((call) => call.method === 'config/batchWrite');
+  assert.equal(configWrite.params.cwd, context.cwd);
+  assert.deepEqual(configWrite.params.edits, [
+    { keyPath: 'model', value: 'gpt-5.6-sol', mergeStrategy: 'upsert' },
+    { keyPath: 'model_reasoning_effort', value: 'medium', mergeStrategy: 'replace' },
+  ]);
 });
 
 test('planner tasks support persisted parent-child relationships', () => {
@@ -230,6 +249,8 @@ test('session rows expose deletion and article refresh does not change the mobil
   assert.match(articles, /previous\?\.key === payload\.key && previous\.updatedAt === payload\.updatedAt && previous\.source === payload\.source/);
   assert.match(articles, /\/api\/article\/status\?source=/);
   assert.match(articles, /status\.updatedAt !== current\.updatedAt/);
+  assert.match(articles, /const ARTICLE_CHECK_INTERVAL_MS = 30_000/);
+  assert.match(articles, /上次检查[\s\S]*下次检查/);
   assert.match(articles, /reader\.scrollTop = pending\.scrollTop/);
   assert.match(articles, /target\.getBoundingClientRect\(\)\.top/);
   assert.match(articles, /function buildArticleTree\(articles: ArticleSummary\[\]\)/);
@@ -264,12 +285,18 @@ test('the main chat exposes persisted quick mode, model controls, and independen
   assert.doesNotMatch(chat, />默认模型</);
   assert.doesNotMatch(chat, />默认强度</);
   assert.match(hook, /startNewSession = useCallback\(async \(mode: ChatMode = 'work'\)/);
-  assert.match(hook, /context\.scope === 'workspace' && preferredId === undefined[\s\S]*setCurrentSession\(null\)/);
+  assert.match(hook, /context\.scope === 'workspace' && preferredId == null[\s\S]*setCurrentSession\(null\)/);
+  assert.match(hook, /onSessionUrlChange\?\.\(createdSession\.id, 'replace'\)/);
+  assert.match(hook, /missingSessionId/);
   assert.match(hook, /if \(!session\) \{[\s\S]*?\/api\/chat\/sessions[\s\S]*?mode: draftMode/);
   assert.match(hook, /method: 'PATCH'/);
   assert.match(server, /mode === 'quick' && context\.scope !== 'workspace'/);
   assert.match(server, /url\.pathname === '\/api\/chat\/models'/);
-  assert.match(app, /const initialModule = requested ===[\s\S]*?: 'chat';/);
+  assert.match(server, /const MODEL_CATALOG_TTL_MS = 60 \* 60 \* 1000/);
+  assert.match(server, /url\.pathname === '\/api\/chat\/models\/refresh'/);
+  assert.match(app, /return Number\.isSafeInteger\(legacySession\)[\s\S]*`\/chat\/\$\{legacySession\}` : '\/chat'/);
+  assert.match(app, /path\.match\(\/\^\\\/chat\(\?:\\\/\(\\d\+\)\)\?\$\//);
+  assert.match(app, /onSessionUrlChange=\{changeSessionUrl\}/);
   assert.doesNotMatch(app, /mainworker:module/);
   assert.match(app, /mainworker:rail-collapsed/);
   assert.match(chat, /mainworker:chat-sidebar-collapsed/);
@@ -331,10 +358,22 @@ test('a handbook source can opt into listing README as its navigable table of co
 
 test('the quota module is reachable from desktop and mobile navigation without polling', () => {
   const app = fs.readFileSync(path.join(projectRoot, 'components/workbench-app.tsx'), 'utf8');
+  const settings = fs.readFileSync(path.join(projectRoot, 'components/settings-module.tsx'), 'utf8');
   const limits = fs.readFileSync(path.join(projectRoot, 'components/limits-module.tsx'), 'utf8');
   const server = fs.readFileSync(path.join(projectRoot, 'server/index.js'), 'utf8');
-  assert.match(app, /id: 'limits'.*label: '额度'/);
-  assert.match(app, /module === 'limits'.*<LimitsModule/);
+  const css = fs.readFileSync(path.join(projectRoot, 'app/globals.css'), 'utf8');
+  assert.match(app, /\/settings\/usage/);
+  assert.match(settings, /id: 'usage'.*label: '用量与额度'/);
+  assert.match(settings, /section === 'usage'.*<LimitsModule/);
+  assert.match(settings, /const settingsLoadStarted = useRef\(false\)/);
+  assert.match(settings, /const settingsLoadInFlight = useRef\(false\)/);
+  assert.match(settings, /if \(settingsLoadInFlight\.current\) return/);
+  assert.match(settings, /!settingsLoadStarted\.current/);
+  assert.match(settings, />重新加载设置</);
+  assert.match(css, /\.tool-grid\s*\{[^}]*grid-template-columns:\s*repeat\(auto-fill,minmax\(156px,176px\)\)/s);
+  assert.match(css, /\.tool-card\s*\{[^}]*min-height:\s*176px;[^}]*flex-direction:\s*column/s);
+  assert.match(css, /\.settings-nav nav\s*\{[^}]*scrollbar-width:\s*none/s);
+  assert.match(css, /\.settings-nav nav::-webkit-scrollbar\s*\{[^}]*display:\s*none/s);
   assert.doesNotMatch(limits, /setInterval[\s\S]*api<LimitsPayload>/);
   assert.match(limits, /const available = clampPercent\(100 - used\)/);
   assert.match(limits, /if \(minutes === 7 \* 1440\) return '周额度';/);
