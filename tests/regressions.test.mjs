@@ -297,6 +297,10 @@ test('the main chat exposes persisted quick mode, model controls, and independen
   assert.match(app, /return Number\.isSafeInteger\(legacySession\)[\s\S]*`\/chat\/\$\{legacySession\}` : '\/chat'/);
   assert.match(app, /path\.match\(\/\^\\\/chat\(\?:\\\/\(\\d\+\)\)\?\$\//);
   assert.match(app, /onSessionUrlChange=\{changeSessionUrl\}/);
+  assert.match(app, /const LAST_CHAT_HREF_KEY = 'mainworker:last-chat-href'/);
+  assert.match(app, /const lastChatHref = useRef\('\/chat'\)/);
+  assert.match(app, /navigate\(view === 'chat' \? lastChatHref\.current : hrefForView\(view\)\)/);
+  assert.match(app, /rememberChatHref\(href\);[\s\S]*history\[mode === 'replace'/);
   assert.doesNotMatch(app, /mainworker:module/);
   assert.match(app, /mainworker:rail-collapsed/);
   assert.match(chat, /mainworker:chat-sidebar-collapsed/);

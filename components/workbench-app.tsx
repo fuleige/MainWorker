@@ -1,6 +1,6 @@
 'use client';
 
-import { SyntheticEvent, useCallback, useEffect, useState } from 'react';
+import { SyntheticEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { LayoutGrid, MessageSquareText, PanelLeftClose, PanelLeftOpen, Settings2, ShieldCheck } from 'lucide-react';
 import { ArticlesModule } from '@/components/articles-module';
 import { ChatWorkspace } from '@/components/chat-workspace';
@@ -13,6 +13,8 @@ import { Input } from '@/components/ui/input';
 
 type ViewId = 'chat' | 'workbench' | 'articles' | 'planner' | 'settings';
 type AppRoute = { view: ViewId; sessionId: number | null; settingsSection: SettingsSection };
+
+const LAST_CHAT_HREF_KEY = 'mainworker:last-chat-href';
 
 const primaryModules = [
   { id: 'chat' as const, label: '对话', icon: MessageSquareText },
@@ -55,6 +57,32 @@ function hrefForView(view: 'chat' | 'workbench' | 'settings') {
   return '/chat';
 }
 
+function normalizedChatHref(value: string | null) {
+  if (!value) return null;
+  const path = value.replace(/\/+$/, '') || '/';
+  return /^\/chat(?:\/[1-9]\d*)?$/.test(path) ? path : null;
+}
+
+function currentChatHref() {
+  return normalizedChatHref(location.pathname);
+}
+
+function storedChatHref() {
+  try {
+    return normalizedChatHref(sessionStorage.getItem(LAST_CHAT_HREF_KEY));
+  } catch {
+    return null;
+  }
+}
+
+function storeChatHref(href: string) {
+  try {
+    sessionStorage.setItem(LAST_CHAT_HREF_KEY, href);
+  } catch {
+    // The URL and in-memory value still preserve navigation when storage is unavailable.
+  }
+}
+
 export function WorkbenchApp() {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
   const [token, setToken] = useState('');
@@ -62,23 +90,36 @@ export function WorkbenchApp() {
   const [loginBusy, setLoginBusy] = useState(false);
   const [route, setRoute] = useState<AppRoute>({ view: 'chat', sessionId: null, settingsSection: 'chat' });
   const [railCollapsed, setRailCollapsed] = useState(false);
+  const lastChatHref = useRef('/chat');
   const requireLogin = useCallback(() => setAuthenticated(false), []);
+  const rememberChatHref = useCallback((href: string) => {
+    const normalized = normalizedChatHref(href) || '/chat';
+    lastChatHref.current = normalized;
+    storeChatHref(normalized);
+  }, []);
 
   useEffect(() => {
     const canonical = canonicalUrl();
     if (`${location.pathname}${location.search}${location.hash}` !== canonical) history.replaceState(null, '', canonical);
+    const initialChatHref = currentChatHref();
+    if (initialChatHref) rememberChatHref(initialChatHref);
+    else lastChatHref.current = storedChatHref() || '/chat';
     queueMicrotask(() => {
       setRoute(readRoute());
       setRailCollapsed(localStorage.getItem('mainworker:rail-collapsed') === '1');
     });
-    const onPopState = () => setRoute(readRoute());
+    const onPopState = () => {
+      const chatHref = currentChatHref();
+      if (chatHref) rememberChatHref(chatHref);
+      setRoute(readRoute());
+    };
     addEventListener('popstate', onPopState);
     fetch('/api/session/status')
       .then((response) => response.json() as Promise<{ authenticated?: boolean }>)
       .then((payload) => setAuthenticated(Boolean(payload.authenticated)))
       .catch(() => setAuthenticated(false));
     return () => removeEventListener('popstate', onPopState);
-  }, []);
+  }, [rememberChatHref]);
 
   useEffect(() => {
     if (route.view === 'chat') return;
@@ -94,17 +135,22 @@ export function WorkbenchApp() {
   function navigate(href: string, mode: 'push' | 'replace' = 'push') {
     const current = `${location.pathname}${location.search}${location.hash}`;
     if (current === href) return;
+    const chatHref = currentChatHref();
+    if (chatHref) rememberChatHref(chatHref);
     history[mode === 'replace' ? 'replaceState' : 'pushState'](null, '', href);
+    const nextChatHref = currentChatHref();
+    if (nextChatHref) rememberChatHref(nextChatHref);
     setRoute(readRoute());
   }
 
   function changeView(view: 'chat' | 'workbench' | 'settings') {
-    navigate(hrefForView(view));
+    navigate(view === 'chat' ? lastChatHref.current : hrefForView(view));
   }
 
   function changeSessionUrl(sessionId: number | null, mode: 'push' | 'replace') {
     const href = sessionId ? `/chat/${sessionId}` : '/chat';
     const current = `${location.pathname}${location.search}`;
+    rememberChatHref(href);
     if (current === href) return;
     history[mode === 'replace' ? 'replaceState' : 'pushState'](null, '', href);
   }
