@@ -6,6 +6,7 @@ import { Marked } from 'marked';
 import { markedHighlight } from 'marked-highlight';
 import sanitizeHtml from 'sanitize-html';
 import { normalizeCodeLanguage, withCodeLineMarkup } from '../lib/code-highlight.js';
+import { normalizeMathDelimiters } from '../lib/markdown-math.js';
 
 const syntaxHighlight = markedHighlight({
   emptyLangClass: 'hljs',
@@ -94,9 +95,18 @@ function resolveContentReference(projectRoot, articlePath, href, sourceId = '') 
   return `/content/${prefix}${relative.join('/')}`;
 }
 
-export async function renderMarkdown(projectRoot, articlePath, source, sourceId = '') {
+function withCopyableCodeBlocks(html) {
+  return html.replace(/<pre><code([^>]*)>([\s\S]*?)<\/code><\/pre>/g, (_block, attributes, content) => {
+    const classNames = attributes.match(/\bclass="([^"]*)"/)?.[1]?.split(/\s+/) || [];
+    const language = classNames.find((name) => name.startsWith('language-'))?.slice('language-'.length);
+    const label = language && /^[a-z0-9_+#.-]{1,32}$/i.test(language) ? language : '代码';
+    return `<div class="code-block"><div class="code-block-toolbar"><span>${label}</span><button type="button" class="code-copy-button" data-copy-code="" aria-label="复制代码">复制</button></div><pre><code${attributes}>${content}</code></pre></div>`;
+  });
+}
+
+export async function renderMarkdown(projectRoot, articlePath, source, sourceId = '', options = {}) {
   const headingCounts = new Map();
-  const html = await markdown.parse(String(source || ''), {
+  const html = await markdown.parse(normalizeMathDelimiters(source), {
     async: true,
     walkTokens(token) {
       void syntaxHighlight.walkTokens(token);
@@ -115,14 +125,15 @@ export async function renderMarkdown(projectRoot, articlePath, source, sourceId 
     },
   });
 
-  return sanitizeHtml(html, {
-    allowedTags: [...sanitizeHtml.defaults.allowedTags, ...EXTRA_TAGS],
+  return sanitizeHtml(options.copyableCode ? withCopyableCodeBlocks(html) : html, {
+    allowedTags: [...sanitizeHtml.defaults.allowedTags, ...EXTRA_TAGS, ...(options.copyableCode ? ['button'] : [])],
     allowedAttributes: {
       ...sanitizeHtml.defaults.allowedAttributes,
       '*': ['class', 'id', 'aria-hidden'],
       a: ['href', 'name', 'target', 'rel', 'title'],
       img: ['src', 'alt', 'title', 'width', 'height', 'loading'],
       input: ['type', 'checked', 'disabled'],
+      button: ['type', 'class', 'data-copy-code', 'aria-label'],
       svg: ['xmlns', 'width', 'height', 'viewBox', 'preserveAspectRatio'],
       path: ['d'],
       annotation: ['encoding'], math: ['xmlns', 'display'],

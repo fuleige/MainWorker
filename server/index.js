@@ -517,7 +517,7 @@ async function executeRun(run, session) {
     run.status = 'failed';
     if (run.turnId) database.updateTurn({ turnId: run.turnId, assistantText: run.assistantText, status: run.status, error: error.message });
     publishRun(run, 'error', { message: error.message });
-    const html = await renderMarkdown(run.context.cwd, run.context.markdownBase, run.assistantText, run.context.sourceId || '').catch(() => '');
+    const html = await renderMarkdown(run.context.cwd, run.context.markdownBase, run.assistantText, run.context.sourceId || '', { copyableCode: true }).catch(() => '');
     publishRun(run, 'final', { text: run.assistantText, html, status: run.status, error: error.message });
     cleanup();
     finishRun(run);
@@ -561,7 +561,7 @@ async function executeRun(run, session) {
       run.status = params.turn?.status || 'completed';
       const errorText = params.turn?.error?.message || null;
       database.updateTurn({ turnId: run.turnId, assistantText: run.assistantText, status: run.status, error: errorText });
-      const html = await renderMarkdown(run.context.cwd, run.context.markdownBase, run.assistantText, run.context.sourceId || '');
+      const html = await renderMarkdown(run.context.cwd, run.context.markdownBase, run.assistantText, run.context.sourceId || '', { copyableCode: true });
       completed = true;
       publishRun(run, 'final', { text: run.assistantText, html, status: run.status, error: errorText, firstDeltaMs: run.firstDeltaAt ? run.firstDeltaAt - run.startedAt : null });
       cleanup();
@@ -652,7 +652,7 @@ async function reconnectChat(response, url) {
   if (!turn) return sendError(response, 404, '运行中的任务不存在或已经结束');
   openSse(response);
   for (const entry of database.listEvents(turn.turn_id, afterSeq)) sendSse(response, entry.event, entry.payload);
-  const html = await renderMarkdown(context.cwd, context.markdownBase, turn.assistant_text, context.sourceId || '');
+  const html = await renderMarkdown(context.cwd, context.markdownBase, turn.assistant_text, context.sourceId || '', { copyableCode: true });
   sendSse(response, 'final', { text: turn.assistant_text, html, status: turn.status, error: turn.error });
   response.end();
 }
@@ -852,7 +852,7 @@ async function requestHandler(request, response) {
     if (!session) return sendError(response, 404, '会话不存在');
     const turns = await Promise.all(database.listTurns(sessionId).map(async (turn) => ({
       ...turn,
-      assistantHtml: turn.assistant_text ? await renderMarkdown(context.cwd, context.markdownBase, turn.assistant_text, context.sourceId || '') : '',
+      assistantHtml: turn.assistant_text ? await renderMarkdown(context.cwd, context.markdownBase, turn.assistant_text, context.sourceId || '', { copyableCode: true }) : '',
     })));
     return sendJson(response, 200, { session: publicSession(session), threadId: session.thread_id, turns, activeRun: activeRunsBySession.has(sessionId) ? publicRun(activeRunsBySession.get(sessionId)) : null });
   }

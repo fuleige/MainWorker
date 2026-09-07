@@ -33,9 +33,9 @@ type SettingsPayload = {
 };
 
 const sections = [
+  { id: 'usage' as const, label: '用量与额度', icon: Gauge },
   { id: 'chat' as const, label: '对话默认值', icon: SlidersHorizontal },
   { id: 'models' as const, label: '模型与 Codex', icon: Database },
-  { id: 'usage' as const, label: '用量与额度', icon: Gauge },
   { id: 'security' as const, label: '安全', icon: ShieldCheck },
 ];
 

@@ -9,8 +9,24 @@ import { CodexAppServerClient } from '../server/codex-client.js';
 import { ContentRepository, renderMarkdown } from '../server/content.js';
 import { WorkbenchDatabase } from '../server/db.js';
 import { normalizeCodeLanguage, withCodeLineMarkup } from '../lib/code-highlight.js';
+import { codeTextFromRenderedLines } from '../lib/code-copy.js';
+import { normalizeMathDelimiters } from '../lib/markdown-math.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+function pngMetadata(file) {
+  const image = fs.readFileSync(path.join(projectRoot, file));
+  assert.deepEqual([...image.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
+  return { width: image.readUInt32BE(16), height: image.readUInt32BE(20), colorType: image[25] };
+}
+
+test('the generated MainWorker browser icon stays lightweight and registered', () => {
+  const layout = fs.readFileSync(path.join(projectRoot, 'app/layout.tsx'), 'utf8');
+  assert.match(layout, /favicon-v2\.png[\s\S]*64x64/);
+  assert.deepEqual(pngMetadata('public/favicon-v2.png'), { width: 64, height: 64, colorType: 6 });
+  assert.ok(fs.statSync(path.join(projectRoot, 'public/favicon-v2.png')).size < 10_000);
+  assert.doesNotMatch(layout, /apple-touch-icon-v2|mainworker-icon-(?:192|512)|site\.webmanifest/);
+});
 
 test('deleting an older conversation preserves the other sessions', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mainworker-db-test-'));
@@ -209,18 +225,20 @@ test('in-progress assistant replies render tolerant streaming markdown', () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8'));
   assert.match(chat, /<StreamingMarkdown source=\{message\.text\} \/>/);
   assert.match(streaming, /useDeferredValue\(source\)/);
-  assert.match(streaming, /stabilizeOpenCodeFence\(deferredSource\)/);
-  assert.match(streaming, /components=\{\{ code: StreamingCode \}\}[\s\S]*skipHtml/);
+  assert.match(streaming, /stabilizeOpenCodeFence\(normalizeMathDelimiters\(deferredSource\)\)/);
+  assert.match(streaming, /components=\{\{ code: StreamingCode, pre: StreamingPre \}\}[\s\S]*rehypePlugins=\{rehypePlugins\}[\s\S]*skipHtml/);
   assert.match(streaming, /highlight\.js\/lib\/languages\/cpp/);
   assert.match(streaming, /highlight\.js\/lib\/languages\/python/);
   assert.match(streaming, /highlight\.js\/lib\/languages\/java/);
   assert.match(streaming, /highlight\.js\/lib\/languages\/yaml/);
   assert.match(streaming, /highlight\.js\/lib\/languages\/bash/);
   assert.equal(pkg.dependencies['react-markdown'], '^10.1.0');
+  assert.equal(pkg.dependencies['rehype-katex'], '^7.0.1');
   assert.equal(pkg.dependencies['remark-gfm'], '^4.0.1');
+  assert.equal(pkg.dependencies['remark-math'], '^6.0.0');
 });
 
-test('code highlighting normalizes common aliases and preserves multiline spans', () => {
+test('code highlighting normalizes common aliases and preserves multiline spans', async () => {
   assert.equal(normalizeCodeLanguage('c++'), 'cpp');
   assert.equal(normalizeCodeLanguage('py'), 'python');
   assert.equal(normalizeCodeLanguage('yml'), 'yaml');
@@ -229,12 +247,26 @@ test('code highlighting normalizes common aliases and preserves multiline spans'
   assert.equal(normalizeCodeLanguage('shellscript'), 'bash');
   const markup = withCodeLineMarkup('<span class="hljs-comment">first\nsecond</span>');
   assert.equal(markup, '<span class="code-line"><span class="hljs-comment">first</span></span><span class="code-line"><span class="hljs-comment">second</span></span>');
+  assert.equal(codeTextFromRenderedLines(['first', '\u200b', '  third']), 'first\n\n  third');
 
   const css = fs.readFileSync(path.join(projectRoot, 'app/globals.css'), 'utf8');
+  const copyable = fs.readFileSync(path.join(projectRoot, 'components/copyable-code.tsx'), 'utf8');
+  const chat = fs.readFileSync(path.join(projectRoot, 'components/chat-workspace.tsx'), 'utf8');
   assert.match(css, /\.markdown-body :not\(pre\) > code \{[^}]*overflow-wrap:\s*normal;[^}]*word-break:\s*normal;/s);
   assert.match(css, /\.markdown-body pre code \{[^}]*font-size:\s*inherit;[^}]*line-height:\s*inherit;/s);
   assert.match(css, /pre:not\(:has\(\.code-line \+ \.code-line\)\) \{[^}]*padding:\s*12px 14px;/s);
   assert.match(css, /pre:not\(:has\(\.code-line \+ \.code-line\)\) \.code-line::before \{[^}]*display:\s*none;/s);
+  assert.match(css, /\.markdown-body \.code-copy-button\s*\{/);
+  assert.match(copyable, /codeTextFromRenderedLines\(lines\.map/);
+  assert.match(copyable, /navigator\.clipboard\?\.writeText/);
+  assert.match(copyable, /document\.execCommand\('copy'\)/);
+  assert.doesNotMatch(copyable, /querySelectorAll\('pre'\)|pre\.replaceWith\(frame\)/);
+  assert.match(chat, /<StaticMarkdown[\s\S]*html=\{message\.html\}/);
+
+  const codeHtml = await renderMarkdown(projectRoot, 'chat.md', '```js\nconst first = 1;\n\nconst second = 2;\n```', '', { copyableCode: true });
+  assert.match(codeHtml, /<div class="code-block">/);
+  assert.match(codeHtml, /<button[^>]*data-copy-code(?:="")?[^>]*>复制<\/button>/);
+  assert.equal((codeHtml.match(/class="code-line"/g) || []).length, 3);
 });
 
 test('KaTeX keeps required layout styles while unsafe inline styles stay blocked', async () => {
@@ -242,9 +274,19 @@ test('KaTeX keeps required layout styles while unsafe inline styles stay blocked
   const html = await renderMarkdown(
     projectRoot,
     'formula.md',
-    `行内 $${formula}$\n\n$$\n${formula}\n$$\n\n<span style="position:fixed;top:999px;height:1em;background-image:url(https://example.com/x)">unsafe</span>\n\n<svg viewBox="0 0 1 1" onload="alert(1)"><path d="M0 0L1 1" onclick="alert(1)"></path></svg>`,
+    String.raw`行内 \(${formula}\)
+
+\[
+${formula}
+\]
+
+<span style="position:fixed;top:999px;height:1em;background-image:url(https://example.com/x)">unsafe</span>
+
+<svg viewBox="0 0 1 1" onload="alert(1)"><path d="M0 0L1 1" onclick="alert(1)"></path></svg>`,
   );
 
+  assert.equal(normalizeMathDelimiters(String.raw`行内 \(x+1\)，块级 \[y=2\]`), '行内 $x+1$，块级 $$y=2$$');
+  assert.equal(normalizeMathDelimiters('`\\(x\\)`\n\n```tex\n\\[x\\]\n```'), '`\\(x\\)`\n\n```tex\n\\[x\\]\n```');
   assert.match(html, /class="katex"/);
   assert.match(html, /height:[\d.]+em/);
   assert.match(html, /top:-?[\d.]+em/);
@@ -297,7 +339,7 @@ test('session rows expose deletion and article refresh does not change the mobil
   assert.match(css, /\.article-tree-group\.is-project > \.article-tree-toggle/);
 });
 
-test('the main chat exposes persisted quick mode, model controls, and independent sidebar toggles', () => {
+test('the main chat exposes persisted quick mode, model controls, and a collapsible conversation sidebar', () => {
   const chat = fs.readFileSync(path.join(projectRoot, 'components/chat-workspace.tsx'), 'utf8');
   const hook = fs.readFileSync(path.join(projectRoot, 'hooks/use-chat.ts'), 'utf8');
   const app = fs.readFileSync(path.join(projectRoot, 'components/workbench-app.tsx'), 'utf8');
@@ -334,9 +376,9 @@ test('the main chat exposes persisted quick mode, model controls, and independen
   assert.match(app, /navigate\(view === 'chat' \? lastChatHref\.current : hrefForView\(view\)\)/);
   assert.match(app, /rememberChatHref\(href\);[\s\S]*history\[mode === 'replace'/);
   assert.doesNotMatch(app, /mainworker:module/);
-  assert.match(app, /mainworker:rail-collapsed/);
+  assert.doesNotMatch(app, /mainworker:rail-collapsed|折叠工具栏|展开工具栏/);
   assert.match(chat, /mainworker:chat-sidebar-collapsed/);
-  assert.match(css, /\.workbench-shell\.is-rail-collapsed\s*\{[^}]*grid-template-columns:\s*34px/s);
+  assert.doesNotMatch(css, /\.workbench-shell\.is-rail-collapsed|\.app-rail\.is-collapsed|\.rail-expand/);
   assert.match(css, /\.chat-workspace\.is-sidebar-collapsed\s*\{[^}]*grid-template-columns:\s*48px/s);
 });
 
@@ -399,7 +441,8 @@ test('the quota module is reachable from desktop and mobile navigation without p
   const server = fs.readFileSync(path.join(projectRoot, 'server/index.js'), 'utf8');
   const css = fs.readFileSync(path.join(projectRoot, 'app/globals.css'), 'utf8');
   assert.match(app, /\/settings\/usage/);
-  assert.match(settings, /id: 'usage'.*label: '用量与额度'/);
+  assert.match(app, /settingsSection: \(settingsMatch\[1\] \|\| 'usage'\)/);
+  assert.match(settings, /const sections = \[\s*\{ id: 'usage'.*label: '用量与额度'/);
   assert.match(settings, /section === 'usage'.*<LimitsModule/);
   assert.match(settings, /const settingsLoadStarted = useRef\(false\)/);
   assert.match(settings, /const settingsLoadInFlight = useRef\(false\)/);

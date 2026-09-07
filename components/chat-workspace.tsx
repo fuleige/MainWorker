@@ -28,6 +28,7 @@ import {
 } from '@/components/ui/sheet';
 import { Textarea } from '@/components/ui/textarea';
 import { StreamingMarkdown } from '@/components/streaming-markdown';
+import { StaticMarkdown } from '@/components/copyable-code';
 import { api } from '@/lib/workbench-api';
 import { ChatMode, ChatSession, useChat } from '@/hooks/use-chat';
 
@@ -376,7 +377,7 @@ export function ChatWorkspace(props: ChatWorkspaceProps) {
                   <div className="message-meta">{message.role === 'assistant' && <span className="agent-avatar"><Sparkles /></span>}<span>{message.role === 'user' ? '你' : 'Codex'}</span></div>
                   {message.role === 'user' ? <p>{message.text}</p> : (
                     message.html
-                      ? <div className={`agent-copy markdown-body ${message.status === 'inProgress' ? 'is-streaming' : ''}`} dangerouslySetInnerHTML={{ __html: message.html }} />
+                      ? <StaticMarkdown className={`agent-copy markdown-body ${message.status === 'inProgress' ? 'is-streaming' : ''}`} html={message.html} />
                       : <div className={`agent-copy markdown-body ${message.status === 'inProgress' ? 'is-streaming' : ''}`}><StreamingMarkdown source={message.text} /></div>
                   )}
                 </article>

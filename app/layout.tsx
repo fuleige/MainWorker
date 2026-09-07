@@ -5,6 +5,10 @@ import './globals.css';
 export const metadata: Metadata = {
   title: 'MainWorker · 个人工作台',
   description: '基于 Codex App Server 的个人工作台',
+  icons: {
+    icon: [{ url: '/favicon-v2.png', type: 'image/png', sizes: '64x64' }],
+    shortcut: '/favicon-v2.png',
+  },
 };
 
 const iosChromeRestorationStyle = `

@@ -1,7 +1,7 @@
 'use client';
 
 import { SyntheticEvent, useCallback, useEffect, useRef, useState } from 'react';
-import { LayoutGrid, MessageSquareText, PanelLeftClose, PanelLeftOpen, Settings2, ShieldCheck } from 'lucide-react';
+import { LayoutGrid, MessageSquareText, Settings2, ShieldCheck } from 'lucide-react';
 import { ArticlesModule } from '@/components/articles-module';
 import { ChatWorkspace } from '@/components/chat-workspace';
 import { PlannerModule } from '@/components/planner-module';
@@ -42,19 +42,19 @@ function readRoute(): AppRoute {
   const chatMatch = path.match(/^\/chat(?:\/(\d+))?$/);
   if (chatMatch) {
     const sessionId = chatMatch[1] ? Number(chatMatch[1]) : null;
-    return { view: 'chat', sessionId, settingsSection: 'chat' };
+    return { view: 'chat', sessionId, settingsSection: 'usage' };
   }
-  if (path === '/workbench') return { view: 'workbench', sessionId: null, settingsSection: 'chat' };
-  if (path === '/tools/articles') return { view: 'articles', sessionId: null, settingsSection: 'chat' };
-  if (path === '/tools/planner') return { view: 'planner', sessionId: null, settingsSection: 'chat' };
+  if (path === '/workbench') return { view: 'workbench', sessionId: null, settingsSection: 'usage' };
+  if (path === '/tools/articles') return { view: 'articles', sessionId: null, settingsSection: 'usage' };
+  if (path === '/tools/planner') return { view: 'planner', sessionId: null, settingsSection: 'usage' };
   const settingsMatch = path.match(/^\/settings(?:\/(chat|models|usage|security))?$/);
-  if (settingsMatch) return { view: 'settings', sessionId: null, settingsSection: (settingsMatch[1] || 'chat') as SettingsSection };
-  return { view: 'chat', sessionId: null, settingsSection: 'chat' };
+  if (settingsMatch) return { view: 'settings', sessionId: null, settingsSection: (settingsMatch[1] || 'usage') as SettingsSection };
+  return { view: 'chat', sessionId: null, settingsSection: 'usage' };
 }
 
 function hrefForView(view: 'chat' | 'workbench' | 'settings') {
   if (view === 'workbench') return '/workbench';
-  if (view === 'settings') return '/settings/chat';
+  if (view === 'settings') return '/settings/usage';
   return '/chat';
 }
 
@@ -90,8 +90,7 @@ export function WorkbenchApp() {
   const [token, setToken] = useState('');
   const [loginError, setLoginError] = useState('');
   const [loginBusy, setLoginBusy] = useState(false);
-  const [route, setRoute] = useState<AppRoute>({ view: 'chat', sessionId: null, settingsSection: 'chat' });
-  const [railCollapsed, setRailCollapsed] = useState(false);
+  const [route, setRoute] = useState<AppRoute>({ view: 'chat', sessionId: null, settingsSection: 'usage' });
   const lastChatHref = useRef('/chat');
   const requireLogin = useCallback(() => setAuthenticated(false), []);
   const rememberChatHref = useCallback((href: string) => {
@@ -108,7 +107,6 @@ export function WorkbenchApp() {
     else lastChatHref.current = storedChatHref() || '/chat';
     queueMicrotask(() => {
       setRoute(readRoute());
-      setRailCollapsed(localStorage.getItem('mainworker:rail-collapsed') === '1');
     });
     const onPopState = () => {
       const chatHref = currentChatHref();
@@ -157,14 +155,6 @@ export function WorkbenchApp() {
     history[mode === 'replace' ? 'replaceState' : 'pushState'](null, '', href);
   }
 
-  function toggleRail() {
-    setRailCollapsed((current) => {
-      const next = !current;
-      localStorage.setItem('mainworker:rail-collapsed', next ? '1' : '0');
-      return next;
-    });
-  }
-
   async function login(event: SyntheticEvent<HTMLFormElement>) {
     event.preventDefault();
     setLoginError('');
@@ -195,20 +185,13 @@ export function WorkbenchApp() {
   if (authenticated === null) return <main className="boot-screen"><span className="brand-mark">M</span><p>正在打开 MainWorker…</p></main>;
 
   return (
-    <main className={`workbench-shell ${railCollapsed ? 'is-rail-collapsed' : ''}`}>
-      <aside className={`app-rail ${railCollapsed ? 'is-collapsed' : ''}`} aria-label="主导航">
-        {railCollapsed ? (
-          <Button className="rail-button rail-expand" variant="ghost" size="icon-sm" aria-label="展开工具栏" title="展开工具栏" onClick={toggleRail}><PanelLeftOpen /></Button>
-        ) : (
-          <>
-            <div className="brand-mark" aria-label="MainWorker">M</div>
-            <nav className="rail-nav">{primaryModules.map((item) => <Button key={item.id} className={`rail-button ${primaryView === item.id ? 'is-active' : ''}`} variant="ghost" size="icon-lg" aria-label={item.label} title={item.label} onClick={() => changeView(item.id)}><item.icon /></Button>)}</nav>
-            <div className="rail-footer">
-              <Button className="rail-button" variant="ghost" size="icon-lg" aria-label="折叠工具栏" title="折叠工具栏" onClick={toggleRail}><PanelLeftClose /></Button>
-              <Button className={`rail-button ${route.view === 'settings' ? 'is-active' : ''}`} variant="ghost" size="icon-lg" aria-label="设置" title="设置" onClick={() => changeView('settings')}><Settings2 /></Button>
-            </div>
-          </>
-        )}
+    <main className="workbench-shell">
+      <aside className="app-rail" aria-label="主导航">
+        <div className="brand-mark" aria-label="MainWorker">M</div>
+        <nav className="rail-nav">{primaryModules.map((item) => <Button key={item.id} className={`rail-button ${primaryView === item.id ? 'is-active' : ''}`} variant="ghost" size="icon-lg" aria-label={item.label} title={item.label} onClick={() => changeView(item.id)}><item.icon /></Button>)}</nav>
+        <div className="rail-footer">
+          <Button className={`rail-button ${route.view === 'settings' ? 'is-active' : ''}`} variant="ghost" size="icon-lg" aria-label="设置" title="设置" onClick={() => changeView('settings')}><Settings2 /></Button>
+        </div>
       </aside>
 
       <div className="module-stage">

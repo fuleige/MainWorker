@@ -1,6 +1,6 @@
 'use client';
 
-import { type ComponentProps, useDeferredValue } from 'react';
+import { Children, type ComponentProps, isValidElement, useDeferredValue } from 'react';
 import hljs from 'highlight.js/lib/core';
 import bash from 'highlight.js/lib/languages/bash';
 import cpp from 'highlight.js/lib/languages/cpp';
@@ -15,10 +15,15 @@ import typescript from 'highlight.js/lib/languages/typescript';
 import xml from 'highlight.js/lib/languages/xml';
 import yaml from 'highlight.js/lib/languages/yaml';
 import ReactMarkdown from 'react-markdown';
+import rehypeKatex from 'rehype-katex';
 import remarkGfm from 'remark-gfm';
+import remarkMath from 'remark-math';
+import { CopyablePre } from '@/components/copyable-code';
 import { escapeCodeHtml, normalizeCodeLanguage, withCodeLineMarkup } from '@/lib/code-highlight';
+import { normalizeMathDelimiters } from '@/lib/markdown-math';
 
-const remarkPlugins = [remarkGfm];
+const remarkPlugins = [remarkGfm, remarkMath];
+const rehypePlugins = [rehypeKatex];
 
 hljs.registerLanguage('bash', bash);
 hljs.registerLanguage('cpp', cpp);
@@ -65,11 +70,20 @@ function StreamingCode({ node: _node, className, children, ...props }: Streaming
   return <code className={codeClassName} data-language={language || undefined} {...props} dangerouslySetInnerHTML={{ __html: withCodeLineMarkup(highlighted) }} />;
 }
 
+type StreamingPreProps = ComponentProps<'pre'> & { node?: unknown };
+
+function StreamingPre({ node: _node, children, ...props }: StreamingPreProps) {
+  const code = Children.toArray(children).find((child) => isValidElement(child));
+  const className = isValidElement<{ className?: string }>(code) ? code.props.className : '';
+  const language = normalizeCodeLanguage(/language-([^\s]+)/.exec(className || '')?.[1]);
+  return <CopyablePre language={language} {...props}>{children}</CopyablePre>;
+}
+
 export function StreamingMarkdown({ source }: { source: string }) {
   const deferredSource = useDeferredValue(source);
   return (
-    <ReactMarkdown components={{ code: StreamingCode }} remarkPlugins={remarkPlugins} skipHtml>
-      {stabilizeOpenCodeFence(deferredSource)}
+    <ReactMarkdown components={{ code: StreamingCode, pre: StreamingPre }} remarkPlugins={remarkPlugins} rehypePlugins={rehypePlugins} skipHtml>
+      {stabilizeOpenCodeFence(normalizeMathDelimiters(deferredSource))}
     </ReactMarkdown>
   );
 }
