@@ -150,6 +150,24 @@ test('planner tasks support persisted parent-child relationships', () => {
   }
 });
 
+test('article revisions are stored per turn and can be marked safely reverted', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mainworker-article-revision-test-'));
+  const database = new WorkbenchDatabase(directory);
+  try {
+    const revision = database.createArticleRevision({
+      articleKey: 'source:articles/sample.md', sourceId: 'source', articlePath: 'articles/sample.md', turnId: 'turn-revision',
+      beforeHash: 'before', afterHash: 'after', beforeSource: '# 修改前', afterSource: '# 修改后',
+    });
+    assert.equal(revision.before_source, '# 修改前');
+    assert.equal(database.getArticleRevisionByTurn('turn-revision').after_source, '# 修改后');
+    const reverted = database.markArticleRevisionReverted(Number(revision.id), '2026-09-07T10:00:00.000Z');
+    assert.equal(reverted.reverted_at, '2026-09-07T10:00:00.000Z');
+  } finally {
+    database.database.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('chat layout keeps the composer fixed while messages scroll independently', () => {
   const css = fs.readFileSync(path.join(projectRoot, 'app/globals.css'), 'utf8');
   const chat = fs.readFileSync(path.join(projectRoot, 'components/chat-workspace.tsx'), 'utf8');
@@ -203,11 +221,28 @@ test('iOS Chrome reloads compositor-broken history restorations without changing
 
 test('article columns have independent bounded scroll containers', () => {
   const css = fs.readFileSync(path.join(projectRoot, 'app/globals.css'), 'utf8');
+  const app = fs.readFileSync(path.join(projectRoot, 'components/workbench-app.tsx'), 'utf8');
+  const articles = fs.readFileSync(path.join(projectRoot, 'components/articles-module.tsx'), 'utf8');
+  const registry = fs.readFileSync(path.join(projectRoot, 'components/workbench-tools.tsx'), 'utf8');
+  const workbench = fs.readFileSync(path.join(projectRoot, 'components/tool-workbench.tsx'), 'utf8');
   assert.match(css, /\.articles-module\s*\{[^}]*min-height:\s*0;[^}]*overflow:\s*hidden;/s);
   assert.match(css, /\.article-library\s*\{[^}]*min-height:\s*0;[^}]*overflow:\s*hidden;/s);
-  assert.match(css, /\.article-reader\s*\{[^}]*min-height:\s*0;[^}]*overflow-y:\s*auto;/s);
+  assert.match(css, /\.article-reader\s*\{[^}]*min-height:\s*0;[^}]*overflow:\s*hidden;/s);
+  assert.match(css, /\.article-reader-scroll\s*\{[^}]*min-height:\s*0;[^}]*overflow-y:\s*auto;/s);
   assert.match(css, /\.article-chat\s*\{[^}]*min-height:\s*0;[^}]*overflow:\s*hidden;/s);
   assert.match(css, /\.markdown-body table\s*\{[^}]*width:\s*max-content;[^}]*max-width:\s*100%;[^}]*overflow-x:\s*auto;/s);
+  assert.match(app, /const activeTool = route\.view === 'tool'[\s\S]*workbenchToolById\(route\.toolId\)/);
+  assert.match(app, /const isStandaloneTool = Boolean\(activeTool\)/);
+  assert.equal((app.match(/isStandaloneTool \? null : \(/g) || []).length, 2);
+  assert.doesNotMatch(app, /ArticlesModule|PlannerModule|route\.view === 'articles'|route\.view === 'planner'/);
+  assert.match(registry, /export const workbenchTools = \[/);
+  assert.match(registry, /component: lazy\(async \(\) => \(\{ default: \(await import\('@\/components\/articles-module'\)\)\.ArticlesModule \}\)\)/);
+  assert.match(registry, /component: lazy\(async \(\) => \(\{ default: \(await import\('@\/components\/planner-module'\)\)\.PlannerModule \}\)\)/);
+  assert.match(workbench, /workbenchTools\.map\(\(tool\) =>/);
+  assert.match(css, /\.workbench-shell\.is-tool-standalone\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/s);
+  assert.match(css, /@media \(max-width:\s*720px\)[\s\S]*?\.workbench-shell\.is-tool-standalone\s*\{[^}]*padding-bottom:\s*0;/s);
+  assert.match(css, /\.workbench-shell\.is-tool-standalone \.module-stage\s*\{[^}]*height:\s*100dvh;/s);
+  assert.match(articles, /className="article-mobile-nav"[\s\S]*>目录<[\s\S]*>正文<[\s\S]*>审核</);
 });
 
 test('the interface and markdown use a stable typography scale', () => {
@@ -312,7 +347,7 @@ test('article headings, fragment links and task checkboxes survive safe renderin
   assert.equal((html.match(/checked/g) || []).length, 1);
 });
 
-test('session rows expose deletion and article refresh does not change the mobile pane', () => {
+test('article review uses one logical level, bottom status, and AI-only editing controls', () => {
   const chat = fs.readFileSync(path.join(projectRoot, 'components/chat-workspace.tsx'), 'utf8');
   const articles = fs.readFileSync(path.join(projectRoot, 'components/articles-module.tsx'), 'utf8');
   const css = fs.readFileSync(path.join(projectRoot, 'app/globals.css'), 'utf8');
@@ -324,19 +359,28 @@ test('session rows expose deletion and article refresh does not change the mobil
   assert.match(articles, /\/api\/article\/status\?source=/);
   assert.match(articles, /status\.updatedAt !== current\.updatedAt/);
   assert.match(articles, /const ARTICLE_CHECK_INTERVAL_MS = 30_000/);
-  assert.match(articles, /上次检查[\s\S]*下次检查/);
+  assert.match(articles, /`上次 \$\{clockTime\(sync\.lastAttemptAt\)\} · 下次 \$\{clockTime\(sync\.nextAt\)\}`/);
   assert.match(articles, /reader\.scrollTop = pending\.scrollTop/);
   assert.match(articles, /target\.getBoundingClientRect\(\)\.top/);
-  assert.match(articles, /function buildArticleTree\(articles: ArticleSummary\[\]\)/);
-  assert.match(articles, /kind: 'project' \| 'folder'/);
-  assert.match(articles, /className="article-tree-toggle"[\s\S]*aria-expanded=\{expanded\}/);
-  assert.match(articles, /searching \|\| !collapsedGroups\.has\(group\.key\)/);
-  assert.match(articles, /aria-label="按项目和文件夹分类的文章目录"/);
-  assert.match(articles, /aria-label="搜索文章标题"/);
+  assert.match(articles, /function buildLogicalLevel\(articles: ArticleSummary\[\], directory: string, query: string\)/);
+  assert.match(articles, /const folders = new Map<string/);
+  assert.match(articles, /const allFolders = new Map<string/);
+  assert.match(articles, /articleFileName\(logicalPath\(article\)\)\.toLowerCase\(\)\.includes\(normalizedQuery\)/);
+  assert.match(articles, /className="article-folder-item"/);
+  assert.match(articles, /aria-label="文章逻辑目录"/);
+  assert.match(articles, /className="article-breadcrumb"/);
+  assert.doesNotMatch(articles, /ArticleTreeGroupView|collapsedGroups|article-tree-toggle/);
+  assert.match(articles, /aria-label="全局搜索文件夹或文件名"/);
   assert.match(articles, /scope="article"/);
+  assert.match(articles, /AI 审核清单/);
+  assert.match(articles, /最终检查/);
+  assert.doesNotMatch(articles, /selectionchange|selectedText|询问选中内容/);
+  assert.match(articles, /className="article-status-bar"/);
+  assert.match(chat, /AI 已更新 Markdown 文件/);
+  assert.match(chat, /\/api\/article\/revision\/undo/);
   assert.doesNotMatch(articles, /整个项目|article-scope-tabs|scope=\{scope\}/);
-  assert.match(css, /\.article-tree-children\s*\{[^}]*border-left:/s);
-  assert.match(css, /\.article-tree-group\.is-project > \.article-tree-toggle/);
+  assert.match(css, /\.article-review-items\s*\{[^}]*grid-template-columns:\s*repeat\(3,/s);
+  assert.match(css, /\.article-status-bar\s*\{/);
 });
 
 test('the main chat exposes persisted quick mode, model controls, and a collapsible conversation sidebar', () => {
@@ -395,10 +439,11 @@ test('article sources can list, read and render assets without legacy signature 
     assert.equal(articles.length, 1);
     assert.equal(articles[0].sourceId, 'test');
     assert.equal(articles[0].key, 'articles/sample.md');
+    assert.equal(articles[0].logicalPath, 'sample.md');
     assert.equal(articles[0].excerpt.startsWith('示例'), false);
-    assert.equal((await content.listArticles('示例')).length, 1);
+    assert.equal((await content.listArticles('示例')).length, 0);
     assert.equal((await content.listArticles('正文摘要')).length, 0);
-    assert.equal((await content.listArticles('sample')).length, 0);
+    assert.equal((await content.listArticles('sample')).length, 1);
     assert.equal((await content.listArticles('测试文章')).length, 0);
 
     const article = await content.readArticle('test', 'articles/sample.md');
@@ -406,8 +451,21 @@ test('article sources can list, read and render assets without legacy signature 
     assert.match(article.html, /\/content\/test\/assets\/sample\.png/);
     assert.match(article.html, /class="code-line"/);
     assert.match(article.html, /class="hljs-built_in"/);
+    assert.match(article.html, /data-copy-code(?:="")?/);
+    assert.equal(article.logicalPath, 'sample.md');
     assert.equal(content.resolveAsset('test', 'assets/sample.png'), path.join(directory, 'assets', 'sample.png'));
-    assert.equal((await content.statArticle('test', 'articles/sample.md')).updatedAt, article.updatedAt);
+    const status = await content.statArticle('test', 'articles/sample.md');
+    assert.equal(status.updatedAt, article.updatedAt);
+    assert.equal(status.logicalPath, 'sample.md');
+
+    const before = await content.snapshotArticle('test', 'articles/sample.md');
+    fs.writeFileSync(path.join(directory, 'articles', 'sample.md'), '# 示例\n\nAI 更新后的正文。');
+    const after = await content.snapshotArticle('test', 'articles/sample.md');
+    assert.notEqual(after.hash, before.hash);
+    await content.restoreArticle('test', 'articles/sample.md', before.source, after.hash);
+    assert.equal((await content.snapshotArticle('test', 'articles/sample.md')).hash, before.hash);
+    fs.writeFileSync(path.join(directory, 'articles', 'sample.md'), '# 示例\n\n后续人工更新。');
+    await assert.rejects(() => content.restoreArticle('test', 'articles/sample.md', before.source, after.hash), /不能直接撤销/);
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
@@ -429,6 +487,60 @@ test('a handbook source can opt into listing README as its navigable table of co
     assert.match((await handbookContent.readArticle('handbook', 'handbook/01.md')).html, /article=handbook%2FREADME\.md/);
     assert.match((await handbookContent.readArticle('handbook', 'handbook/README.md')).html, /article=handbook%2F01\.md#%E5%AD%A6%E4%B9%A0%E7%9B%AE%E6%A0%87/);
     assert.match((await handbookContent.readArticle('handbook', 'handbook/01.md')).html, /<h2 id="学习目标">/);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('physical article roots collapse into one shared logical hierarchy', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mainworker-logical-articles-test-'));
+  try {
+    const firstRoot = path.join(directory, 'first');
+    const secondRoot = path.join(directory, 'second');
+    fs.mkdirSync(path.join(firstRoot, 'articles', '专题'), { recursive: true });
+    fs.mkdirSync(path.join(secondRoot, 'knowledge', '专题'), { recursive: true });
+    fs.writeFileSync(path.join(firstRoot, 'articles', '专题', '甲.md'), '# 甲');
+    fs.writeFileSync(path.join(secondRoot, 'knowledge', '专题', '乙.md'), '# 乙');
+    const content = new ContentRepository([
+      { id: 'first', root: firstRoot, articleDirectories: ['articles'] },
+      { id: 'second', root: secondRoot, articleDirectories: ['knowledge'] },
+    ]);
+
+    const articles = await content.listArticles();
+    assert.deepEqual(articles.map((article) => article.logicalPath).sort((left, right) => left.localeCompare(right)), ['专题/乙.md', '专题/甲.md'].sort((left, right) => left.localeCompare(right)));
+    assert.deepEqual(new Set(articles.map((article) => article.logicalPath.split('/')[0])), new Set(['专题']));
+    assert.equal(new Set(articles.map((article) => article.sourceId)).size, 2);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('imported roots expose at most two logical folder levels and search paths globally', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mainworker-imported-roots-test-'));
+  try {
+    const basicProjectRoot = path.join(directory, 'Basic');
+    const basicRoot = path.join(basicProjectRoot, 'articles');
+    const algorithmRoot = path.join(directory, 'AlgorithmLearn');
+    fs.mkdirSync(path.join(basicRoot, 'leetcode', 'nested'), { recursive: true });
+    fs.mkdirSync(path.join(algorithmRoot, 'leetcode-math'), { recursive: true });
+    fs.writeFileSync(path.join(basicRoot, 'root-note.md'), '# 根级文章');
+    fs.writeFileSync(path.join(basicRoot, 'leetcode', '技巧.md'), '# 技巧文章');
+    fs.writeFileSync(path.join(basicRoot, 'leetcode', 'nested', '过深.md'), '# 不应导入');
+    fs.writeFileSync(path.join(algorithmRoot, 'leetcode-math', '整数.md'), '# 整数文章');
+    const content = new ContentRepository([
+      { id: 'basic', root: basicProjectRoot, articleDirectories: ['articles'], includeReadme: true, logicalRoot: 'Basic 文章', maxDirectoryDepth: 1 },
+      { id: 'algorithm', root: algorithmRoot, articleDirectories: [], includeAllMarkdown: true, includeReadme: true, logicalRoot: 'AlgorithmLearn', maxDirectoryDepth: 1 },
+    ]);
+
+    assert.deepEqual((await content.listArticles()).map((article) => article.logicalPath).sort((left, right) => left.localeCompare(right)), [
+      'AlgorithmLearn/leetcode-math/整数.md',
+      'Basic 文章/leetcode/技巧.md',
+      'Basic 文章/root-note.md',
+    ].sort((left, right) => left.localeCompare(right)));
+    assert.equal((await content.listArticles('leetcode')).length, 2);
+    assert.equal((await content.listArticles('root-note')).length, 1);
+    assert.equal((await content.listArticles('根级文章')).length, 0);
+    assert.deepEqual((await content.listArticles('root-note')).map((article) => article.path), ['articles/root-note.md']);
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }

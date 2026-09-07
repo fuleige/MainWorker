@@ -1,19 +1,18 @@
 'use client';
 
-import { SyntheticEvent, useCallback, useEffect, useRef, useState } from 'react';
+import { Suspense, SyntheticEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { LayoutGrid, MessageSquareText, Settings2, ShieldCheck } from 'lucide-react';
-import { ArticlesModule } from '@/components/articles-module';
 import { ChatWorkspace } from '@/components/chat-workspace';
-import { PlannerModule } from '@/components/planner-module';
 import { SettingsModule, SettingsSection } from '@/components/settings-module';
 import { ToolWorkbench } from '@/components/tool-workbench';
+import { type WorkbenchToolId, workbenchToolById, workbenchToolByLegacyModule, workbenchToolByPath } from '@/components/workbench-tools';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { useIOSChromeRestorationReload } from '@/hooks/use-ios-chrome-restoration-reload';
 
-type ViewId = 'chat' | 'workbench' | 'articles' | 'planner' | 'settings';
-type AppRoute = { view: ViewId; sessionId: number | null; settingsSection: SettingsSection };
+type ViewId = 'chat' | 'workbench' | 'tool' | 'settings';
+type AppRoute = { view: ViewId; toolId: WorkbenchToolId | null; sessionId: number | null; settingsSection: SettingsSection };
 
 const LAST_CHAT_HREF_KEY = 'mainworker:last-chat-href';
 
@@ -26,12 +25,12 @@ function canonicalUrl() {
   const current = new URL(location.href);
   if (current.pathname !== '/') return `${current.pathname}${current.search}${current.hash}`;
   const legacyModule = current.searchParams.get('module');
-  if (legacyModule === 'articles') {
+  const legacyTool = workbenchToolByLegacyModule(legacyModule);
+  if (legacyTool) {
     current.searchParams.delete('module');
     const query = current.searchParams.toString();
-    return `/tools/articles${query ? `?${query}` : ''}${current.hash}`;
+    return `${legacyTool.href}${query ? `?${query}` : ''}${current.hash}`;
   }
-  if (legacyModule === 'planner') return '/tools/planner';
   if (legacyModule === 'limits') return '/settings/usage';
   const legacySession = Number(current.searchParams.get('session'));
   return Number.isSafeInteger(legacySession) && legacySession > 0 ? `/chat/${legacySession}` : '/chat';
@@ -42,14 +41,14 @@ function readRoute(): AppRoute {
   const chatMatch = path.match(/^\/chat(?:\/(\d+))?$/);
   if (chatMatch) {
     const sessionId = chatMatch[1] ? Number(chatMatch[1]) : null;
-    return { view: 'chat', sessionId, settingsSection: 'usage' };
+    return { view: 'chat', toolId: null, sessionId, settingsSection: 'usage' };
   }
-  if (path === '/workbench') return { view: 'workbench', sessionId: null, settingsSection: 'usage' };
-  if (path === '/tools/articles') return { view: 'articles', sessionId: null, settingsSection: 'usage' };
-  if (path === '/tools/planner') return { view: 'planner', sessionId: null, settingsSection: 'usage' };
+  if (path === '/workbench') return { view: 'workbench', toolId: null, sessionId: null, settingsSection: 'usage' };
+  const tool = workbenchToolByPath(path);
+  if (tool) return { view: 'tool', toolId: tool.id, sessionId: null, settingsSection: 'usage' };
   const settingsMatch = path.match(/^\/settings(?:\/(chat|models|usage|security))?$/);
-  if (settingsMatch) return { view: 'settings', sessionId: null, settingsSection: (settingsMatch[1] || 'usage') as SettingsSection };
-  return { view: 'chat', sessionId: null, settingsSection: 'usage' };
+  if (settingsMatch) return { view: 'settings', toolId: null, sessionId: null, settingsSection: (settingsMatch[1] || 'usage') as SettingsSection };
+  return { view: 'chat', toolId: null, sessionId: null, settingsSection: 'usage' };
 }
 
 function hrefForView(view: 'chat' | 'workbench' | 'settings') {
@@ -90,8 +89,9 @@ export function WorkbenchApp() {
   const [token, setToken] = useState('');
   const [loginError, setLoginError] = useState('');
   const [loginBusy, setLoginBusy] = useState(false);
-  const [route, setRoute] = useState<AppRoute>({ view: 'chat', sessionId: null, settingsSection: 'usage' });
+  const [route, setRoute] = useState<AppRoute>({ view: 'chat', toolId: null, sessionId: null, settingsSection: 'usage' });
   const lastChatHref = useRef('/chat');
+  const activeTool = route.view === 'tool' && route.toolId ? workbenchToolById(route.toolId) : undefined;
   const requireLogin = useCallback(() => setAuthenticated(false), []);
   const rememberChatHref = useCallback((href: string) => {
     const normalized = normalizedChatHref(href) || '/chat';
@@ -123,14 +123,16 @@ export function WorkbenchApp() {
 
   useEffect(() => {
     if (route.view === 'chat') return;
-    const titles: Record<Exclude<ViewId, 'chat'>, string> = {
+    if (route.view === 'tool') {
+      document.title = activeTool?.documentTitle || '工作台 · MainWorker';
+      return;
+    }
+    const titles: Record<Exclude<ViewId, 'chat' | 'tool'>, string> = {
       workbench: '工作台 · MainWorker',
-      articles: '文章审核 · MainWorker',
-      planner: '个人规划 · MainWorker',
       settings: '设置 · MainWorker',
     };
     document.title = titles[route.view];
-  }, [route.view]);
+  }, [activeTool, route.view]);
 
   function navigate(href: string, mode: 'push' | 'replace' = 'push') {
     const current = `${location.pathname}${location.search}${location.hash}`;
@@ -180,33 +182,37 @@ export function WorkbenchApp() {
     setAuthenticated(false);
   }
 
-  const primaryView = route.view === 'articles' || route.view === 'planner' ? 'workbench' : route.view;
+  const isStandaloneTool = Boolean(activeTool);
+  const ToolComponent = activeTool?.component;
 
   if (authenticated === null) return <main className="boot-screen"><span className="brand-mark">M</span><p>正在打开 MainWorker…</p></main>;
 
   return (
-    <main className="workbench-shell">
-      <aside className="app-rail" aria-label="主导航">
-        <div className="brand-mark" aria-label="MainWorker">M</div>
-        <nav className="rail-nav">{primaryModules.map((item) => <Button key={item.id} className={`rail-button ${primaryView === item.id ? 'is-active' : ''}`} variant="ghost" size="icon-lg" aria-label={item.label} title={item.label} onClick={() => changeView(item.id)}><item.icon /></Button>)}</nav>
-        <div className="rail-footer">
-          <Button className={`rail-button ${route.view === 'settings' ? 'is-active' : ''}`} variant="ghost" size="icon-lg" aria-label="设置" title="设置" onClick={() => changeView('settings')}><Settings2 /></Button>
-        </div>
-      </aside>
+    <main className={`workbench-shell ${isStandaloneTool ? 'is-tool-standalone' : ''}`}>
+      {isStandaloneTool ? null : (
+        <aside className="app-rail" aria-label="主导航">
+          <div className="brand-mark" aria-label="MainWorker">M</div>
+          <nav className="rail-nav">{primaryModules.map((item) => <Button key={item.id} className={`rail-button ${route.view === item.id ? 'is-active' : ''}`} variant="ghost" size="icon-lg" aria-label={item.label} title={item.label} onClick={() => changeView(item.id)}><item.icon /></Button>)}</nav>
+          <div className="rail-footer">
+            <Button className={`rail-button ${route.view === 'settings' ? 'is-active' : ''}`} variant="ghost" size="icon-lg" aria-label="设置" title="设置" onClick={() => changeView('settings')}><Settings2 /></Button>
+          </div>
+        </aside>
+      )}
 
       <div className="module-stage">
         {authenticated && route.view === 'chat' ? <ChatWorkspace scope="workspace" title="MainWorker" subtitle="永久会话 · 当前工作目录" sessionId={route.sessionId} onSessionUrlChange={changeSessionUrl} onUnauthorized={requireLogin} /> : null}
         {authenticated && route.view === 'workbench' ? <ToolWorkbench /> : null}
-        {authenticated && route.view === 'articles' ? <ArticlesModule onUnauthorized={requireLogin} /> : null}
-        {authenticated && route.view === 'planner' ? <PlannerModule onUnauthorized={requireLogin} /> : null}
+        {authenticated && ToolComponent ? <Suspense fallback={<div className="tool-loading">正在打开{activeTool.title}…</div>}><ToolComponent onUnauthorized={requireLogin} /></Suspense> : null}
         {authenticated && route.view === 'settings' ? <SettingsModule section={route.settingsSection} onNavigate={(section) => navigate(`/settings/${section}`)} onUnauthorized={requireLogin} onLogout={() => void logout()} /> : null}
       </div>
 
-      <nav className="mobile-tabs" aria-label="移动端导航">
-        <button className={primaryView === 'chat' ? 'is-active' : ''} onClick={() => changeView('chat')}><MessageSquareText /><span>对话</span></button>
-        <button className={primaryView === 'workbench' ? 'is-active' : ''} onClick={() => changeView('workbench')}><LayoutGrid /><span>工作台</span></button>
-        <button className={primaryView === 'settings' ? 'is-active' : ''} onClick={() => changeView('settings')}><Settings2 /><span>设置</span></button>
-      </nav>
+      {isStandaloneTool ? null : (
+        <nav className="mobile-tabs" aria-label="移动端导航">
+          <button className={route.view === 'chat' ? 'is-active' : ''} onClick={() => changeView('chat')}><MessageSquareText /><span>对话</span></button>
+          <button className={route.view === 'workbench' ? 'is-active' : ''} onClick={() => changeView('workbench')}><LayoutGrid /><span>工作台</span></button>
+          <button className={route.view === 'settings' ? 'is-active' : ''} onClick={() => changeView('settings')}><Settings2 /><span>设置</span></button>
+        </nav>
+      )}
 
       <Dialog open={!authenticated} onOpenChange={() => {}}>
         <DialogContent showCloseButton={false} className="login-dialog">

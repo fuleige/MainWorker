@@ -29,6 +29,20 @@ export type ChatModel = {
   reasoningEfforts: Array<{ id: string; description: string }>;
 };
 
+export type ArticleChange = {
+  revisionId: number;
+  changed: true;
+  changedAt: string;
+  revertedAt: string | null;
+  canUndo: boolean;
+};
+
+export type ChatRunResult = {
+  status: string;
+  text: string;
+  articleChange: ArticleChange | null;
+};
+
 type ChatModelCatalog = {
   models: ChatModel[];
   defaultModel: string;
@@ -42,6 +56,7 @@ export type ChatMessage = {
   text: string;
   html?: string;
   status?: string;
+  articleChange?: ArticleChange | null;
 };
 
 type ActiveRun = {
@@ -61,6 +76,7 @@ type UseChatOptions = {
   onUnauthorized?: () => void;
   sessionId?: number | null;
   onSessionUrlChange?: (sessionId: number | null, historyMode: 'push' | 'replace') => void;
+  onRunComplete?: (result: ChatRunResult) => void;
 };
 
 type StoredTurn = {
@@ -70,13 +86,14 @@ type StoredTurn = {
   assistantHtml?: string;
   status: string;
   error?: string | null;
+  articleChange?: ArticleChange | null;
 };
 
 function eventText(value: unknown, fallback = '') {
   return typeof value === 'string' || typeof value === 'number' ? String(value) : fallback;
 }
 
-export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauthorized, sessionId: requestedSessionId = null, onSessionUrlChange }: UseChatOptions) {
+export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauthorized, sessionId: requestedSessionId = null, onSessionUrlChange, onRunComplete }: UseChatOptions) {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [currentSession, setCurrentSession] = useState<ChatSession | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -101,6 +118,11 @@ export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauth
   const controllerRef = useRef<AbortController | null>(null);
   const scopeRef = useRef({ scope, articlePath, sourceId });
   const draftModeRef = useRef<ChatMode>('work');
+  const onRunCompleteRef = useRef(onRunComplete);
+
+  useEffect(() => {
+    onRunCompleteRef.current = onRunComplete;
+  }, [onRunComplete]);
 
   useEffect(() => {
     scopeRef.current = { scope, articlePath, sourceId };
@@ -181,12 +203,19 @@ export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauth
           setActivity(eventText(payload.message, '执行失败'));
         }
         if (event === 'final') {
+          const articleChange = payload.articleChange && typeof payload.articleChange === 'object'
+            ? payload.articleChange as ArticleChange
+            : null;
+          const status = eventText(payload.status, 'completed');
+          const text = eventText(payload.text, eventText(payload.error));
           setAssistant(assistantId, (message) => ({
             ...message,
-            text: eventText(payload.text, eventText(payload.error, message.text)),
+            text: text || message.text,
             html: eventText(payload.html),
-            status: eventText(payload.status, 'completed'),
+            status,
+            articleChange,
           }));
+          onRunCompleteRef.current?.({ status, text, articleChange });
           activeRef.current = null;
           setSending(false);
           setActivity(payload.status === 'completed' ? '已完成' : payload.status === 'interrupted' ? '已停止' : '执行结束');
@@ -244,6 +273,7 @@ export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauth
           text: turn.assistant_text || turn.error || '',
           html: payload.activeRun?.turnId === turnId ? undefined : turn.assistantHtml || '',
           status: turn.status || '',
+          articleChange: turn.articleChange || null,
         });
       }
     }

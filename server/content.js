@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import hljs from 'highlight.js';
@@ -200,6 +201,10 @@ function isUnder(relative, directory) {
   return relative === directory || relative.startsWith(`${directory}/`);
 }
 
+function sourceHash(source) {
+  return crypto.createHash('sha256').update(source).digest('hex');
+}
+
 function isExplicitlyExcluded(source) {
   const frontmatter = String(source || '').slice(0, 8192).match(/^---\s*\n([\s\S]*?)\n---(?:\n|$)/);
   return Boolean(frontmatter && /^mainworker:\s*(?:false|ignore|exclude)\s*$/im.test(frontmatter[1]));
@@ -234,15 +239,25 @@ export class ContentRepository {
       if (ids.has(id)) throw new Error(`文章来源 id 重复：${id}`);
       ids.add(id);
       const root = path.resolve(String(definition.root || ''));
-      const articleDirectories = (definition.articleDirectories || ['articles']).map((directory) => normalizeRelative(directory, `文章来源 ${id} 的 articleDirectories`));
+      const articleDirectories = (definition.articleDirectories ?? ['articles']).map((directory) => normalizeRelative(directory, `文章来源 ${id} 的 articleDirectories`));
       const exclude = (definition.exclude || []).map((entry) => normalizeRelative(entry, `文章来源 ${id} 的 exclude`));
+      const logicalRoot = String(definition.logicalRoot || '').trim();
+      if (logicalRoot && (logicalRoot.includes('/') || logicalRoot.includes('\\') || logicalRoot === '.' || logicalRoot === '..')) {
+        throw new Error(`文章来源 ${id} 的 logicalRoot 必须是单级目录名`);
+      }
+      const maxDirectoryDepth = Number.isSafeInteger(definition.maxDirectoryDepth) && definition.maxDirectoryDepth >= 0
+        ? definition.maxDirectoryDepth
+        : null;
       return {
         id,
         name: String(definition.name || id).trim() || id,
         root,
         articleDirectories,
+        includeAllMarkdown: definition.includeAllMarkdown === true,
         includeRootMarkdown: definition.includeRootMarkdown === true,
         includeReadme: definition.includeReadme === true,
+        logicalRoot,
+        maxDirectoryDepth,
         exclude,
       };
     });
@@ -255,8 +270,11 @@ export class ContentRepository {
       id: source.id,
       name: source.name,
       articleDirectories: source.articleDirectories,
+      includeAllMarkdown: source.includeAllMarkdown,
       includeRootMarkdown: source.includeRootMarkdown,
       includeReadme: source.includeReadme,
+      logicalRoot: source.logicalRoot,
+      maxDirectoryDepth: source.maxDirectoryDepth,
     }));
   }
 
@@ -272,6 +290,17 @@ export class ContentRepository {
     return source === this.defaultSource ? articlePath : `${source.id}:${articlePath}`;
   }
 
+  logicalPath(source, articlePath) {
+    let relative = articlePath;
+    if (!source.includeAllMarkdown && articlePath.includes('/')) {
+      const directory = source.articleDirectories
+        .filter((candidate) => isUnder(articlePath, candidate))
+        .sort((left, right) => right.length - left.length)[0];
+      if (directory) relative = articlePath.slice(directory.length + 1);
+    }
+    return source.logicalRoot ? `${source.logicalRoot}/${relative}` : relative;
+  }
+
   isExcludedPath(source, relative, entry = null) {
     const parts = relative.split('/');
     const name = parts.at(-1) || '';
@@ -284,8 +313,18 @@ export class ContentRepository {
 
   isArticlePath(source, relative) {
     if (!relative.toLowerCase().endsWith('.md') || this.isExcludedPath(source, relative, { isFile: () => true })) return false;
+    if (source.includeAllMarkdown) {
+      const directoryDepth = relative.split('/').length - 1;
+      return source.maxDirectoryDepth == null || directoryDepth <= source.maxDirectoryDepth;
+    }
     if (source.includeRootMarkdown && !relative.includes('/')) return true;
-    return source.articleDirectories.some((directory) => isUnder(relative, directory));
+    const directory = source.articleDirectories
+      .filter((candidate) => isUnder(relative, candidate))
+      .sort((left, right) => right.length - left.length)[0];
+    if (!directory) return false;
+    if (source.maxDirectoryDepth == null) return true;
+    const innerPath = relative.slice(directory.length + 1);
+    return innerPath.split('/').length - 1 <= source.maxDirectoryDepth;
   }
 
   resolveArticle(sourceId, articlePath) {
@@ -303,13 +342,19 @@ export class ContentRepository {
     const absolute = path.resolve(source.root, assetPath.split('/').join(path.sep));
     if (!isInside(source.root, absolute)) throw new Error('资源路径无效');
     const relative = path.relative(source.root, absolute).split(path.sep).join('/');
-    const allowed = isUnder(relative, 'assets') || source.articleDirectories.some((directory) => isUnder(relative, directory));
+    const allowed = source.includeAllMarkdown || isUnder(relative, 'assets') || source.articleDirectories.some((directory) => isUnder(relative, directory));
     if (!allowed || this.isExcludedPath(source, relative)) throw new Error('资源路径无效');
     return absolute;
   }
 
   async listSourceArticles(source) {
     const candidates = [];
+    if (source.includeAllMarkdown) {
+      for (const articlePath of await listMarkdownFiles(source.root, '', (relative, entry) => this.isExcludedPath(source, relative, entry))) {
+        if (this.isArticlePath(source, articlePath)) candidates.push(articlePath);
+      }
+      return [...new Set(candidates)];
+    }
     if (source.includeRootMarkdown) {
       let entries = [];
       try {
@@ -345,11 +390,12 @@ export class ContentRepository {
           sourceId: sourceDefinition.id,
           sourceName: sourceDefinition.name,
           path: relative,
+          logicalPath: this.logicalPath(sourceDefinition, relative),
           title,
           excerpt: excerptFromMarkdown(withoutPrimaryHeading(markdownSource)),
           characters: markdownSource.length,
           updatedAt: stat.mtime.toISOString(),
-          matchesQuery: !normalizedQuery || title.toLowerCase().includes(normalizedQuery),
+          matchesQuery: !normalizedQuery || this.logicalPath(sourceDefinition, relative).toLowerCase().includes(normalizedQuery),
         };
       }));
     }));
@@ -366,9 +412,10 @@ export class ContentRepository {
       sourceId: sourceDefinition.id,
       sourceName: sourceDefinition.name,
       path: relative,
+      logicalPath: this.logicalPath(sourceDefinition, relative),
       title: titleFromMarkdown(markdownSource, fallback),
       source: markdownSource,
-      html: await renderMarkdown(sourceDefinition.root, relative, withoutPrimaryHeading(markdownSource), sourceDefinition.id),
+      html: await renderMarkdown(sourceDefinition.root, relative, withoutPrimaryHeading(markdownSource), sourceDefinition.id, { copyableCode: true }),
       characters: markdownSource.length,
       updatedAt: stat.mtime.toISOString(),
     };
@@ -381,7 +428,41 @@ export class ContentRepository {
       key,
       sourceId: sourceDefinition.id,
       path: relative,
+      logicalPath: this.logicalPath(sourceDefinition, relative),
       updatedAt: stat.mtime.toISOString(),
     };
+  }
+
+  async snapshotArticle(sourceId, articlePath) {
+    const { absolute, relative, source, key } = this.resolveArticle(sourceId, articlePath);
+    const [markdownSource, stat] = await Promise.all([fs.readFile(absolute, 'utf8'), fs.stat(absolute)]);
+    return {
+      key,
+      sourceId: source.id,
+      path: relative,
+      source: markdownSource,
+      hash: sourceHash(markdownSource),
+      updatedAt: stat.mtime.toISOString(),
+    };
+  }
+
+  async restoreArticle(sourceId, articlePath, markdownSource, expectedHash) {
+    const { absolute } = this.resolveArticle(sourceId, articlePath);
+    const [currentSource, stat] = await Promise.all([fs.readFile(absolute, 'utf8'), fs.stat(absolute)]);
+    if (expectedHash && sourceHash(currentSource) !== expectedHash) {
+      const error = new Error('文章在本次修改后又有更新，不能直接撤销以免覆盖新内容');
+      error.code = 'ARTICLE_CONFLICT';
+      throw error;
+    }
+    const temporary = `${absolute}.mainworker-${crypto.randomUUID()}.tmp`;
+    try {
+      await fs.writeFile(temporary, String(markdownSource), { encoding: 'utf8', mode: stat.mode });
+      await fs.chmod(temporary, stat.mode);
+      await fs.rename(temporary, absolute);
+    } catch (error) {
+      await fs.rm(temporary, { force: true }).catch(() => {});
+      throw error;
+    }
+    return this.readArticle(sourceId, articlePath);
   }
 }

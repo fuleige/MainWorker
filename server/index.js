@@ -23,16 +23,21 @@ const articleRoot = path.resolve(process.env.ARTICLE_ROOT || '/Users/fulei/Codes
 const algorithmArticleRoot = path.resolve(process.env.ALGORITHM_ARTICLE_ROOT || path.join(projectRoot, '..', 'AlgorithmLearn'));
 const articleSources = [{
   id: 'basic',
-  name: path.basename(articleRoot),
+  name: 'Basic 文章',
   root: articleRoot,
   articleDirectories: ['articles'],
-  includeRootMarkdown: true,
+  includeReadme: true,
+  logicalRoot: 'Basic 文章',
+  maxDirectoryDepth: 1,
 }, {
   id: 'algorithm-learn',
-  name: path.basename(algorithmArticleRoot),
+  name: 'AlgorithmLearn',
   root: algorithmArticleRoot,
-  articleDirectories: ['leetcode-math'],
+  articleDirectories: [],
+  includeAllMarkdown: true,
   includeReadme: true,
+  logicalRoot: 'AlgorithmLearn',
+  maxDirectoryDepth: 1,
 }];
 const host = process.env.API_HOST || '127.0.0.1';
 const port = Number(process.env.API_PORT || 4390);
@@ -180,6 +185,17 @@ function publicSession(session) {
     model: session.model || null, reasoningEffort: session.reasoning_effort || null,
     createdAt: session.created_at, updatedAt: session.activity_at || session.updated_at,
     turnCount: Number(session.turn_count || 0), running: activeRunsBySession.has(Number(session.id)),
+  };
+}
+
+function publicArticleChange(revision) {
+  if (!revision) return null;
+  return {
+    revisionId: Number(revision.id),
+    changed: true,
+    changedAt: revision.created_at,
+    revertedAt: revision.reverted_at || null,
+    canUndo: !revision.reverted_at,
   };
 }
 
@@ -504,6 +520,26 @@ function activityForItem(item, completed = false) {
   return { phase: 'work', label: completed ? '操作完成' : '正在处理' };
 }
 
+async function captureArticleChange(run) {
+  if (run.articleChangeCaptured) return run.articleChange;
+  run.articleChangeCaptured = true;
+  if (run.context.scope !== 'article' || !run.beforeArticle || !run.turnId) return null;
+  const after = await content.snapshotArticle(run.context.sourceId, run.context.articlePath);
+  if (after.hash === run.beforeArticle.hash) return null;
+  const revision = database.createArticleRevision({
+    articleKey: after.key,
+    sourceId: after.sourceId,
+    articlePath: after.path,
+    turnId: run.turnId,
+    beforeHash: run.beforeArticle.hash,
+    afterHash: after.hash,
+    beforeSource: run.beforeArticle.source,
+    afterSource: after.source,
+  });
+  run.articleChange = publicArticleChange(revision);
+  return run.articleChange;
+}
+
 async function executeRun(run, session) {
   let completed = false;
   let finishing = false;
@@ -516,9 +552,10 @@ async function executeRun(run, session) {
     completed = true;
     run.status = 'failed';
     if (run.turnId) database.updateTurn({ turnId: run.turnId, assistantText: run.assistantText, status: run.status, error: error.message });
+    const articleChange = await captureArticleChange(run).catch(() => null);
     publishRun(run, 'error', { message: error.message });
     const html = await renderMarkdown(run.context.cwd, run.context.markdownBase, run.assistantText, run.context.sourceId || '', { copyableCode: true }).catch(() => '');
-    publishRun(run, 'final', { text: run.assistantText, html, status: run.status, error: error.message });
+    publishRun(run, 'final', { text: run.assistantText, html, status: run.status, error: error.message, articleChange });
     cleanup();
     finishRun(run);
   };
@@ -562,8 +599,9 @@ async function executeRun(run, session) {
       const errorText = params.turn?.error?.message || null;
       database.updateTurn({ turnId: run.turnId, assistantText: run.assistantText, status: run.status, error: errorText });
       const html = await renderMarkdown(run.context.cwd, run.context.markdownBase, run.assistantText, run.context.sourceId || '', { copyableCode: true });
+      const articleChange = await captureArticleChange(run);
       completed = true;
-      publishRun(run, 'final', { text: run.assistantText, html, status: run.status, error: errorText, firstDeltaMs: run.firstDeltaAt ? run.firstDeltaAt - run.startedAt : null });
+      publishRun(run, 'final', { text: run.assistantText, html, status: run.status, error: errorText, articleChange, firstDeltaMs: run.firstDeltaAt ? run.firstDeltaAt - run.startedAt : null });
       cleanup();
       finishRun(run);
     }
@@ -590,7 +628,12 @@ async function executeRun(run, session) {
         ? ['当前是 MainWorker 个人工作台的主对话。', `当前工作目录：${projectRoot}`, '结合长期线程上下文处理用户请求。']
       : run.context.scope === 'articles'
         ? [`当前是文章来源“${run.context.sourceName}”的项目级持久化对话。`, `文章库目录：${run.context.cwd}`, '请从整个文章库范围理解任务。']
-        : [`当前文章来源：${run.context.sourceName}`, `当前工作台文章：${run.context.articlePath}`, '这是该文章的持久化审核对话，请结合此前上下文处理。'];
+        : [
+          `当前文章来源：${run.context.sourceName}`,
+          `当前工作台文章：${run.context.articlePath}`,
+          '这是该文章的持久化审核对话，请结合此前上下文处理。',
+          '用户不会在界面里手工编辑 Markdown；当用户要求修正、润色或检查并修复时，请直接修改当前 Markdown 文件，完成后清楚说明检查结果和实际改动。',
+        ];
     const prompt = [...scopePrompt, '用户请求：', run.userText].join('\n\n');
     const turn = await codex.startTurn(run.threadId, prompt, run.context, {
       mode: session.mode === 'quick' ? 'quick' : 'work',
@@ -620,10 +663,14 @@ async function startChat(request, response) {
   if (!userText) return sendError(response, 400, '消息不能为空');
   if (userText.length > 20_000) return sendError(response, 400, '消息过长');
   if (activeRunsBySession.has(sessionId)) return sendError(response, 409, '这个会话已有正在执行的任务');
+  const beforeArticle = context.scope === 'article'
+    ? await content.snapshotArticle(context.sourceId, context.articlePath)
+    : null;
   const run = {
     id: crypto.randomUUID(), sessionId, context, userText, threadId: null, turnId: null,
     assistantText: '', status: 'inProgress', startedAt: Date.now(), firstDeltaAt: null,
     lastAgentItemId: null, seq: 0, events: [], subscribers: new Set(), cancelRequested: false,
+    beforeArticle, articleChange: null, articleChangeCaptured: false,
   };
   activeRunsBySession.set(sessionId, run);
   activeRunsById.set(run.id, run);
@@ -653,7 +700,7 @@ async function reconnectChat(response, url) {
   openSse(response);
   for (const entry of database.listEvents(turn.turn_id, afterSeq)) sendSse(response, entry.event, entry.payload);
   const html = await renderMarkdown(context.cwd, context.markdownBase, turn.assistant_text, context.sourceId || '', { copyableCode: true });
-  sendSse(response, 'final', { text: turn.assistant_text, html, status: turn.status, error: turn.error });
+  sendSse(response, 'final', { text: turn.assistant_text, html, status: turn.status, error: turn.error, articleChange: publicArticleChange(database.getArticleRevisionByTurn(turn.turn_id)) });
   response.end();
 }
 
@@ -725,6 +772,33 @@ async function requestHandler(request, response) {
     const article = await content.readArticle(url.searchParams.get('source'), url.searchParams.get('path'));
     const opened = url.searchParams.get('opened') === '1' ? database.markArticleOpened(article.key) : database.listArticleActivity().get(article.key) || article.updatedAt;
     return sendJson(response, 200, { ...article, lastOpenedAt: opened });
+  }
+  if (request.method === 'GET' && url.pathname === '/api/article/revision') {
+    const revisionId = positiveId(url.searchParams.get('revision'));
+    const revision = revisionId && database.getArticleRevision(revisionId);
+    const article = content.resolveArticle(url.searchParams.get('source'), url.searchParams.get('path'));
+    if (!revision || revision.article_key !== article.key) return sendError(response, 404, '文章修改记录不存在');
+    return sendJson(response, 200, {
+      change: publicArticleChange(revision),
+      beforeSource: revision.before_source,
+      afterSource: revision.after_source,
+    });
+  }
+  if (request.method === 'POST' && url.pathname === '/api/article/revision/undo') {
+    const body = await readJson(request, 4096);
+    const revisionId = positiveId(body.revisionId);
+    const revision = revisionId && database.getArticleRevision(revisionId);
+    const article = content.resolveArticle(body.sourceId, body.path);
+    if (!revision || revision.article_key !== article.key) return sendError(response, 404, '文章修改记录不存在');
+    if (revision.reverted_at) return sendError(response, 409, '这次修改已经撤销');
+    try {
+      const restored = await content.restoreArticle(article.source.id, article.relative, revision.before_source, revision.after_hash);
+      const updatedRevision = database.markArticleRevisionReverted(revision.id);
+      return sendJson(response, 200, { article: restored, change: publicArticleChange(updatedRevision) });
+    } catch (error) {
+      if (error.code === 'ARTICLE_CONFLICT') return sendError(response, 409, error.message);
+      throw error;
+    }
   }
   if (request.method === 'GET' && url.pathname === '/api/settings') {
     const catalog = await readModelCatalog();
@@ -853,6 +927,7 @@ async function requestHandler(request, response) {
     const turns = await Promise.all(database.listTurns(sessionId).map(async (turn) => ({
       ...turn,
       assistantHtml: turn.assistant_text ? await renderMarkdown(context.cwd, context.markdownBase, turn.assistant_text, context.sourceId || '', { copyableCode: true }) : '',
+      articleChange: publicArticleChange(database.getArticleRevisionByTurn(turn.turn_id)),
     })));
     return sendJson(response, 200, { session: publicSession(session), threadId: session.thread_id, turns, activeRun: activeRunsBySession.has(sessionId) ? publicRun(activeRunsBySession.get(sessionId)) : null });
   }

@@ -78,6 +78,22 @@ export class WorkbenchDatabase {
         last_opened_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS article_revisions (
+        id INTEGER PRIMARY KEY,
+        article_key TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        article_path TEXT NOT NULL,
+        turn_id TEXT NOT NULL UNIQUE,
+        before_hash TEXT NOT NULL,
+        after_hash TEXT NOT NULL,
+        before_source TEXT NOT NULL,
+        after_source TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        reverted_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_article_revisions_article
+        ON article_revisions(article_key, created_at DESC, id DESC);
+
       CREATE TABLE IF NOT EXISTS planner_tasks (
         id INTEGER PRIMARY KEY,
         title TEXT NOT NULL,
@@ -231,6 +247,37 @@ export class WorkbenchDatabase {
 
   listArticleActivity() {
     return new Map(this.database.prepare('SELECT article_path, last_opened_at FROM article_activity').all().map((entry) => [entry.article_path, entry.last_opened_at]));
+  }
+
+  createArticleRevision(revision) {
+    this.database.prepare(`
+      INSERT OR IGNORE INTO article_revisions(
+        article_key, source_id, article_path, turn_id, before_hash, after_hash, before_source, after_source
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      revision.articleKey, revision.sourceId, revision.articlePath, revision.turnId,
+      revision.beforeHash, revision.afterHash, revision.beforeSource, revision.afterSource,
+    );
+    this.database.prepare(`
+      DELETE FROM article_revisions
+      WHERE article_key = ? AND id NOT IN (
+        SELECT id FROM article_revisions WHERE article_key = ? ORDER BY id DESC LIMIT 20
+      )
+    `).run(revision.articleKey, revision.articleKey);
+    return this.getArticleRevisionByTurn(revision.turnId);
+  }
+
+  getArticleRevisionByTurn(turnId) {
+    return this.database.prepare('SELECT * FROM article_revisions WHERE turn_id = ?').get(turnId) || null;
+  }
+
+  getArticleRevision(id) {
+    return this.database.prepare('SELECT * FROM article_revisions WHERE id = ?').get(id) || null;
+  }
+
+  markArticleRevisionReverted(id, revertedAt = new Date().toISOString()) {
+    this.database.prepare('UPDATE article_revisions SET reverted_at = ? WHERE id = ?').run(revertedAt, id);
+    return this.getArticleRevision(id);
   }
 
   listTasks() {

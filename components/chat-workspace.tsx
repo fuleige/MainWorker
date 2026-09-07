@@ -1,17 +1,19 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ArrowDown,
   Bookmark,
   Command,
   Globe2,
+  Eye,
   LoaderCircle,
   Menu,
   MessageSquareText,
   PanelLeftClose,
   PanelLeftOpen,
   Plus,
+  RotateCcw,
   Send,
   Sparkles,
   Square,
@@ -30,7 +32,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { StreamingMarkdown } from '@/components/streaming-markdown';
 import { StaticMarkdown } from '@/components/copyable-code';
 import { api } from '@/lib/workbench-api';
-import { ChatMode, ChatSession, useChat } from '@/hooks/use-chat';
+import { ArticleChange, ChatMode, ChatRunResult, ChatSession, useChat } from '@/hooks/use-chat';
 
 const effortLabels: Record<string, string> = {
   low: '低 Low',
@@ -52,7 +54,73 @@ type ChatWorkspaceProps = {
   onUnauthorized?: () => void;
   sessionId?: number | null;
   onSessionUrlChange?: (sessionId: number | null, historyMode: 'push' | 'replace') => void;
+  promptRequest?: { id: number; text: string; send: boolean } | null;
+  onRunComplete?: (result: ChatRunResult) => void;
+  onBusyChange?: (busy: boolean) => void;
+  onArticleChanged?: () => void;
 };
+
+function ArticleChangeCard({ change: initialChange, sourceId, articlePath, onArticleChanged }: {
+  change: ArticleChange;
+  sourceId?: string | null;
+  articlePath?: string | null;
+  onArticleChanged?: () => void;
+}) {
+  const [change, setChange] = useState(initialChange);
+  const [open, setOpen] = useState(false);
+  const [revision, setRevision] = useState<{ beforeSource: string; afterSource: string } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  async function viewRevision() {
+    if (!sourceId || !articlePath) return;
+    setOpen(true);
+    if (revision) return;
+    setLoading(true);
+    setError('');
+    try {
+      const payload = await api<{ beforeSource: string; afterSource: string }>(`/api/article/revision?source=${encodeURIComponent(sourceId)}&path=${encodeURIComponent(articlePath)}&revision=${change.revisionId}`);
+      setRevision(payload);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : '修改记录读取失败');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function undoRevision() {
+    if (!sourceId || !articlePath || !change.canUndo || !window.confirm('撤销这次 AI 对 Markdown 的修改吗？如果文件后来又有更新，系统会自动阻止覆盖。')) return;
+    setLoading(true);
+    setError('');
+    try {
+      const payload = await api<{ change: ArticleChange }>('/api/article/revision/undo', {
+        method: 'POST', body: JSON.stringify({ sourceId, path: articlePath, revisionId: change.revisionId }),
+      });
+      setChange(payload.change);
+      onArticleChanged?.();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : '撤销失败');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className={`article-change-card ${change.revertedAt ? 'is-reverted' : ''}`}>
+      <div><strong>{change.revertedAt ? '这次 Markdown 修改已撤销' : 'AI 已更新 Markdown 文件'}</strong><small>{change.revertedAt ? '原文已安全恢复' : '可查看修改前后全文，或安全撤销本次修改'}</small></div>
+      <span><Button variant="outline" size="sm" onClick={() => void viewRevision()}><Eye />查看改动</Button><Button variant="ghost" size="sm" disabled={!change.canUndo || loading} onClick={() => void undoRevision()}><RotateCcw />撤销</Button></span>
+      {error ? <p role="alert">{error}</p> : null}
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent className="article-revision-dialog">
+          <DialogHeader><DialogTitle>本次 Markdown 改动</DialogTitle><DialogDescription>左侧是修改前，右侧是修改后；这里只读，不会直接编辑原文。</DialogDescription></DialogHeader>
+          {loading && !revision ? <div className="revision-loading"><LoaderCircle className="spin" />正在读取改动…</div> : null}
+          {error && !revision ? <div className="chat-inline-error">{error}</div> : null}
+          {revision ? <div className="article-revision-columns"><section><h3>修改前</h3><pre>{revision.beforeSource}</pre></section><section><h3>修改后</h3><pre>{revision.afterSource}</pre></section></div> : null}
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
 
 function SessionList({
   sessions, current, deletingId, onSelect, onCreate, onDelete,
@@ -156,6 +224,8 @@ function QuickPhrases({ onUse }: { onUse: (text: string) => void }) {
 
 export function ChatWorkspace(props: ChatWorkspaceProps) {
   const chat = useChat(props);
+  const { onBusyChange, promptRequest } = props;
+  const sendChat = chat.send;
   const [draft, setDraft] = useState('');
   const draftStorageKey = `mainworker:composer-draft:${props.scope}:${props.sourceId || ''}:${props.articlePath || ''}`;
   const draftRef = useRef('');
@@ -165,6 +235,7 @@ export function ChatWorkspace(props: ChatWorkspaceProps) {
   const messageStage = useRef<HTMLDivElement>(null);
   const followLatest = useRef(true);
   const lastScrollTop = useRef(0);
+  const handledPromptRequest = useRef<number | null>(null);
   const quickMode = props.scope === 'workspace' && chat.currentMode === 'quick';
   const newSession = props.scope === 'workspace' && !chat.currentSession && !chat.missingSessionId;
 
@@ -179,7 +250,7 @@ export function ChatWorkspace(props: ChatWorkspaceProps) {
     queueMicrotask(() => setDraft(restoredDraft));
   }, [draftStorageKey]);
 
-  function updateDraft(value: string) {
+  const updateDraft = useCallback((value: string) => {
     draftRef.current = value;
     setDraft(value);
     try {
@@ -188,7 +259,24 @@ export function ChatWorkspace(props: ChatWorkspaceProps) {
     } catch {
       // Keep the in-memory draft usable when storage is unavailable.
     }
-  }
+  }, [draftStorageKey]);
+
+  useEffect(() => {
+    onBusyChange?.(chat.sending || chat.loading);
+  }, [chat.loading, chat.sending, onBusyChange]);
+
+  useEffect(() => {
+    const request = promptRequest;
+    if (!request || handledPromptRequest.current === request.id || (request.send && chat.sending)) return;
+    handledPromptRequest.current = request.id;
+    queueMicrotask(() => {
+      if (request.send) {
+        followLatest.current = true;
+        setShowScrollToBottom(false);
+        void sendChat(request.text);
+      } else updateDraft(request.text);
+    });
+  }, [chat.sending, promptRequest, sendChat, updateDraft]);
 
   useEffect(() => {
     if (props.compact) return;
@@ -380,6 +468,7 @@ export function ChatWorkspace(props: ChatWorkspaceProps) {
                       ? <StaticMarkdown className={`agent-copy markdown-body ${message.status === 'inProgress' ? 'is-streaming' : ''}`} html={message.html} />
                       : <div className={`agent-copy markdown-body ${message.status === 'inProgress' ? 'is-streaming' : ''}`}><StreamingMarkdown source={message.text} /></div>
                   )}
+                  {message.role === 'assistant' && message.articleChange ? <ArticleChangeCard change={message.articleChange} sourceId={props.sourceId} articlePath={props.articlePath} onArticleChanged={props.onArticleChanged} /> : null}
                 </article>
               ))}
               {chat.sending && <div className="run-status"><LoaderCircle className="spin" /><span>{chat.activity}</span><Button variant="ghost" size="sm" onClick={() => void chat.interrupt()}><Square />停止</Button></div>}
