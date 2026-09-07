@@ -197,6 +197,14 @@ function normalizeRelative(value, label) {
   return normalized;
 }
 
+function normalizeDirectoryPrefix(value, label) {
+  const normalized = String(value || '').trim();
+  if (!normalized || normalized.includes('/') || normalized.includes('\\') || normalized === '.' || normalized === '..') {
+    throw new Error(`${label} 必须是不含路径分隔符的目录名前缀`);
+  }
+  return normalized;
+}
+
 function isUnder(relative, directory) {
   return relative === directory || relative.startsWith(`${directory}/`);
 }
@@ -240,6 +248,7 @@ export class ContentRepository {
       ids.add(id);
       const root = path.resolve(String(definition.root || ''));
       const articleDirectories = (definition.articleDirectories ?? ['articles']).map((directory) => normalizeRelative(directory, `文章来源 ${id} 的 articleDirectories`));
+      const articleDirectoryPrefixes = (definition.articleDirectoryPrefixes || []).map((prefix) => normalizeDirectoryPrefix(prefix, `文章来源 ${id} 的 articleDirectoryPrefixes`));
       const exclude = (definition.exclude || []).map((entry) => normalizeRelative(entry, `文章来源 ${id} 的 exclude`));
       const logicalRoot = String(definition.logicalRoot || '').trim();
       if (logicalRoot && (logicalRoot.includes('/') || logicalRoot.includes('\\') || logicalRoot === '.' || logicalRoot === '..')) {
@@ -253,9 +262,11 @@ export class ContentRepository {
         name: String(definition.name || id).trim() || id,
         root,
         articleDirectories,
+        articleDirectoryPrefixes,
         includeAllMarkdown: definition.includeAllMarkdown === true,
         includeRootMarkdown: definition.includeRootMarkdown === true,
         includeReadme: definition.includeReadme === true,
+        preserveArticleDirectories: definition.preserveArticleDirectories === true,
         logicalRoot,
         maxDirectoryDepth,
         exclude,
@@ -270,9 +281,11 @@ export class ContentRepository {
       id: source.id,
       name: source.name,
       articleDirectories: source.articleDirectories,
+      articleDirectoryPrefixes: source.articleDirectoryPrefixes,
       includeAllMarkdown: source.includeAllMarkdown,
       includeRootMarkdown: source.includeRootMarkdown,
       includeReadme: source.includeReadme,
+      preserveArticleDirectories: source.preserveArticleDirectories,
       logicalRoot: source.logicalRoot,
       maxDirectoryDepth: source.maxDirectoryDepth,
     }));
@@ -290,12 +303,19 @@ export class ContentRepository {
     return source === this.defaultSource ? articlePath : `${source.id}:${articlePath}`;
   }
 
+  matchingArticleDirectory(source, articlePath) {
+    const matches = source.articleDirectories.filter((candidate) => isUnder(articlePath, candidate));
+    if (articlePath.includes('/')) {
+      const firstDirectory = articlePath.split('/')[0];
+      if (source.articleDirectoryPrefixes.some((prefix) => firstDirectory.startsWith(prefix))) matches.push(firstDirectory);
+    }
+    return matches.sort((left, right) => right.length - left.length)[0] || null;
+  }
+
   logicalPath(source, articlePath) {
     let relative = articlePath;
-    if (!source.includeAllMarkdown && articlePath.includes('/')) {
-      const directory = source.articleDirectories
-        .filter((candidate) => isUnder(articlePath, candidate))
-        .sort((left, right) => right.length - left.length)[0];
+    if (!source.includeAllMarkdown && !source.preserveArticleDirectories && articlePath.includes('/')) {
+      const directory = this.matchingArticleDirectory(source, articlePath);
       if (directory) relative = articlePath.slice(directory.length + 1);
     }
     return source.logicalRoot ? `${source.logicalRoot}/${relative}` : relative;
@@ -318,9 +338,7 @@ export class ContentRepository {
       return source.maxDirectoryDepth == null || directoryDepth <= source.maxDirectoryDepth;
     }
     if (source.includeRootMarkdown && !relative.includes('/')) return true;
-    const directory = source.articleDirectories
-      .filter((candidate) => isUnder(relative, candidate))
-      .sort((left, right) => right.length - left.length)[0];
+    const directory = this.matchingArticleDirectory(source, relative);
     if (!directory) return false;
     if (source.maxDirectoryDepth == null) return true;
     const innerPath = relative.slice(directory.length + 1);
@@ -342,7 +360,7 @@ export class ContentRepository {
     const absolute = path.resolve(source.root, assetPath.split('/').join(path.sep));
     if (!isInside(source.root, absolute)) throw new Error('资源路径无效');
     const relative = path.relative(source.root, absolute).split(path.sep).join('/');
-    const allowed = source.includeAllMarkdown || isUnder(relative, 'assets') || source.articleDirectories.some((directory) => isUnder(relative, directory));
+    const allowed = source.includeAllMarkdown || isUnder(relative, 'assets') || Boolean(this.matchingArticleDirectory(source, relative));
     if (!allowed || this.isExcludedPath(source, relative)) throw new Error('资源路径无效');
     return absolute;
   }
@@ -366,7 +384,21 @@ export class ContentRepository {
         if (entry.isFile() && this.isArticlePath(source, entry.name)) candidates.push(entry.name);
       }
     }
-    for (const directory of source.articleDirectories) {
+    const articleDirectories = new Set(source.articleDirectories);
+    if (source.articleDirectoryPrefixes.length) {
+      let entries = [];
+      try {
+        entries = await fs.readdir(source.root, { withFileTypes: true });
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+      for (const entry of entries) {
+        if (entry.isDirectory() && source.articleDirectoryPrefixes.some((prefix) => entry.name.startsWith(prefix)) && !this.isExcludedPath(source, entry.name, entry)) {
+          articleDirectories.add(entry.name);
+        }
+      }
+    }
+    for (const directory of articleDirectories) {
       for (const articlePath of await listMarkdownFiles(source.root, directory, (relative, entry) => this.isExcludedPath(source, relative, entry))) {
         if (this.isArticlePath(source, articlePath)) candidates.push(articlePath);
       }

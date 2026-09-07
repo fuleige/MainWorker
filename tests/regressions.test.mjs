@@ -546,6 +546,44 @@ test('imported roots expose at most two logical folder levels and search paths g
   }
 });
 
+test('prefixed article directories stay visible while unrelated Markdown remains excluded', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mainworker-prefixed-articles-test-'));
+  try {
+    fs.mkdirSync(path.join(directory, 'part-01-foundations'), { recursive: true });
+    fs.mkdirSync(path.join(directory, 'part-02-deep-learning', 'nested'), { recursive: true });
+    fs.mkdirSync(path.join(directory, 'notes'), { recursive: true });
+    fs.writeFileSync(path.join(directory, 'part-01-foundations', 'chapter-01.md'), '# 第一章');
+    fs.writeFileSync(path.join(directory, 'part-02-deep-learning', 'chapter-02.md'), '# 第二章');
+    fs.writeFileSync(path.join(directory, 'part-02-deep-learning', 'nested', 'draft.md'), '# 过深草稿');
+    fs.writeFileSync(path.join(directory, 'APPENDIX.md'), '# 附录');
+    fs.writeFileSync(path.join(directory, 'notes', 'note.md'), '# 旁注');
+    const content = new ContentRepository([{
+      id: 'deep-learning',
+      root: directory,
+      articleDirectories: [],
+      articleDirectoryPrefixes: ['part-'],
+      preserveArticleDirectories: true,
+      logicalRoot: '深度学习基础',
+      maxDirectoryDepth: 0,
+    }]);
+
+    const articles = await content.listArticles();
+    assert.deepEqual(articles.map((article) => article.path).sort((left, right) => left.localeCompare(right)), [
+      'part-01-foundations/chapter-01.md',
+      'part-02-deep-learning/chapter-02.md',
+    ]);
+    assert.deepEqual(articles.map((article) => article.logicalPath).sort((left, right) => left.localeCompare(right)), [
+      '深度学习基础/part-01-foundations/chapter-01.md',
+      '深度学习基础/part-02-deep-learning/chapter-02.md',
+    ]);
+    assert.equal((await content.listArticles('part-01')).length, 1);
+    assert.throws(() => content.resolveArticle('deep-learning', 'APPENDIX.md'), /不符合文章收录规范/);
+    assert.throws(() => content.resolveArticle('deep-learning', 'part-02-deep-learning/nested/draft.md'), /不符合文章收录规范/);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('the quota module is reachable from desktop and mobile navigation without polling', () => {
   const app = fs.readFileSync(path.join(projectRoot, 'components/workbench-app.tsx'), 'utf8');
   const settings = fs.readFileSync(path.join(projectRoot, 'components/settings-module.tsx'), 'utf8');

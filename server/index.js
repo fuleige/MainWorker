@@ -21,6 +21,7 @@ const dataRoot = path.join(projectRoot, '.data');
 const staticRoot = path.join(projectRoot, 'dist', 'client');
 const articleRoot = path.resolve(process.env.ARTICLE_ROOT || '/Users/fulei/Codes/Basic');
 const algorithmArticleRoot = path.resolve(process.env.ALGORITHM_ARTICLE_ROOT || path.join(projectRoot, '..', 'AlgorithmLearn'));
+const deepLearningBookRoot = path.resolve(process.env.DEEP_LEARNING_BOOK_ROOT || '/Users/fulei/Codes/DLProjects/Interview/book');
 const articleSources = [{
   id: 'basic',
   name: 'Basic 文章',
@@ -38,6 +39,15 @@ const articleSources = [{
   includeReadme: true,
   logicalRoot: 'AlgorithmLearn',
   maxDirectoryDepth: 1,
+}, {
+  id: 'deep-learning-foundations',
+  name: '深度学习基础',
+  root: deepLearningBookRoot,
+  articleDirectories: [],
+  articleDirectoryPrefixes: ['part-'],
+  preserveArticleDirectories: true,
+  logicalRoot: '深度学习基础',
+  maxDirectoryDepth: 0,
 }];
 const host = process.env.API_HOST || '127.0.0.1';
 const port = Number(process.env.API_PORT || 4390);
