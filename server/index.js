@@ -9,6 +9,7 @@ import { createAuth } from './auth.js';
 import { CodexAppServerClient } from './codex-client.js';
 import { ContentRepository, renderMarkdown } from './content.js';
 import { WorkbenchDatabase } from './db.js';
+import { PlannerService, plannerToolResponse } from './planner.js';
 import { RateLimitService } from './rate-limits.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -59,6 +60,7 @@ if (Boolean(tlsCertFile) !== Boolean(tlsKeyFile)) {
 const tlsEnabled = Boolean(tlsCertFile && tlsKeyFile);
 const auth = createAuth(dataRoot);
 const database = new WorkbenchDatabase(dataRoot);
+const planner = new PlannerService(database);
 const content = new ContentRepository(articleSources);
 const articleSourceIds = new Set(content.listSources().map((source) => source.id));
 const defaultArticleSourceId = articleSources[0].id;
@@ -158,9 +160,23 @@ function recordLoginFailure(key) {
   loginAttempts.set(key, current);
 }
 
-function resolveChatContext(scopeValue, articlePathValue, sourceIdValue) {
+function resolveChatContext(scopeValue, articlePathValue, sourceIdValue, contextIdValue) {
   const scope = String(scopeValue || 'workspace');
   if (scope === 'workspace') return { scope, key: 'workspace', cwd: projectRoot, markdownBase: '_workbench.md', articlePath: null, sourceId: null };
+  if (scope === 'planner') {
+    if (contextIdValue && String(contextIdValue) !== 'all') throw new Error('规划上下文无效');
+    return {
+      scope,
+      key: 'planner',
+      cwd: projectRoot,
+      markdownBase: '_planner.md',
+      articlePath: null,
+      sourceId: null,
+      contextId: 'all',
+      plannerSnapshot: planner.snapshot(),
+      readOnly: true,
+    };
+  }
   const source = content.resolveSource(sourceIdValue);
   if (scope === 'articles') {
     return {
@@ -363,13 +379,53 @@ async function ensureConcreteSessionSettings(session) {
   return database.getSession(session.scope, session.context_key, session.id);
 }
 
-function publicTask(task) {
-  return {
-    id: Number(task.id), title: task.title, notes: task.notes, status: task.status,
-    priority: task.priority, dueDate: task.due_date, project: task.project,
-    parentId: task.parent_id ? Number(task.parent_id) : null,
-    createdAt: task.created_at, updatedAt: task.updated_at,
-  };
+codex.setDynamicToolHandler(async (params) => {
+  if (params.tool !== 'manage_personal_plan') return plannerToolResponse(false, { error: '未知的规划工具' });
+  const run = [...activeRunsById.values()].find((candidate) => candidate.context.scope === 'planner'
+    && candidate.threadId === params.threadId
+    && (!candidate.turnId || candidate.turnId === params.turnId));
+  if (!run) return plannerToolResponse(false, { error: '找不到对应的规划会话，未执行任何修改' });
+  try {
+    return plannerToolResponse(true, planner.execute(params.arguments));
+  } catch (error) {
+    return plannerToolResponse(false, { error: error instanceof Error ? error.message : '规划操作失败' });
+  }
+});
+
+function plannerPromptSnapshot(snapshot) {
+  if (!snapshot.projects.length) return '- 暂无项目';
+  const taskByParent = new Map();
+  for (const task of snapshot.tasks) {
+    const key = task.parentId || 0;
+    const children = taskByParent.get(key) || [];
+    children.push(task);
+    taskByParent.set(key, children);
+  }
+  const recurrencesByProject = new Map();
+  for (const recurrence of snapshot.recurrences) {
+    const items = recurrencesByProject.get(recurrence.projectId) || [];
+    items.push(recurrence);
+    recurrencesByProject.set(recurrence.projectId, items);
+  }
+  return snapshot.projects.map((project) => {
+    const tasks = snapshot.tasks.filter((task) => task.projectId === project.id && !task.parentId
+      && (!task.recurrenceId
+        || ['todo', 'doing'].includes(task.status)
+        || Boolean(task.occurrenceDate && task.occurrenceDate >= snapshot.calendar.weekStart && task.occurrenceDate <= snapshot.calendar.weekEnd)));
+    const taskLines = tasks.length ? tasks.map((task) => {
+      const children = taskByParent.get(task.id) || [];
+      const details = `状态=${task.status}；优先级=${task.priority}${task.plannedDate ? `；计划=${task.plannedDate}` : ''}${task.deadlineDate ? `；截止=${task.deadlineDate}` : ''}${task.recurrenceId ? `；循环=${task.recurrenceId}；发生日=${task.occurrenceDate}` : ''}`;
+      return [`- [任务 ${task.id}] ${task.title}；${details}${task.notes ? `；说明=${task.notes}` : ''}`,
+        ...children.map((child) => `  - [子任务 ${child.id}] ${child.title}；状态=${child.status}；优先级=${child.priority}${child.plannedDate ? `；计划=${child.plannedDate}` : ''}${child.deadlineDate ? `；截止=${child.deadlineDate}` : ''}${child.notes ? `；说明=${child.notes}` : ''}`),
+      ].join('\n');
+    }).join('\n') : '- 暂无任务';
+    const recurrences = recurrencesByProject.get(project.id) || [];
+    const recurrenceLines = recurrences.length ? recurrences.map((recurrence) => {
+      const schedule = recurrence.frequency === 'daily' ? '每天' : recurrence.frequency === 'workdays' ? '工作日' : `每周 ${recurrence.weekdays.join(',')}`;
+      return `- [循环 ${recurrence.id}] ${recurrence.title}；状态=${recurrence.state}；规则=${schedule}；开始=${recurrence.startDate}${recurrence.endDate ? `；结束=${recurrence.endDate}` : ''}${recurrence.currentTaskId ? `；当前实例=${recurrence.currentTaskId}` : ''}${recurrence.subtasks.length ? `；子任务模板=${recurrence.subtasks.map((item) => item.title).join('、')}` : ''}`;
+    }).join('\n') : '- 暂无循环任务';
+    return [`## [项目 ${project.id}] ${project.title}；状态=${project.status}${project.notes ? `\n说明：${project.notes}` : ''}`, '普通任务与循环实例：', taskLines, '循环规则：', recurrenceLines].join('\n');
+  }).join('\n\n');
 }
 
 function publicRateLimitWindow(window) {
@@ -636,6 +692,16 @@ async function executeRun(run, session) {
       ? ['当前是 MainWorker 快速问答。', '请直接回答一般问题；需要最新信息或事实核验时使用联网搜索。', '不要访问本地文件或调用本地工具。']
       : run.context.scope === 'workspace'
         ? ['当前是 MainWorker 个人工作台的主对话。', `当前工作目录：${projectRoot}`, '结合长期线程上下文处理用户请求。']
+      : run.context.scope === 'planner'
+        ? [
+          '当前是个人任务规划器。所有内容使用“项目 → 任务 → 一层子任务”结构，不使用领域或收集箱。',
+          `今天是 ${run.context.plannerSnapshot.calendar.today}（Asia/Shanghai），本周是 ${run.context.plannerSnapshot.calendar.weekStart} 至 ${run.context.plannerSnapshot.calendar.weekEnd}。`,
+          `当前规划与本周循环记录（编号是调用规划工具时使用的真实 ID）：\n${plannerPromptSnapshot(run.context.plannerSnapshot)}`,
+          '界面不提供计划内容的手工编辑。用户要求创建、拆解、移动、排期、设截止日期、设置优先级、排序或修改内容时，直接调用 manage_personal_plan 完成真实修改，并简要报告结果。',
+          '循环任务只有一个未解决实例。“完成本次”会产生下一实例，“结束循环”则永久停止。恢复逾期循环或结束仍有当前实例的循环时，如果用户未说明处理方式，必须先询问。',
+          '不要通过终端、文件或其他工具修改规划数据。只有用户明确要求时才允许删除、结束循环、批量取消、完成或归档项目；含义不明确或会大幅改变结构时先询问。',
+          '当用户只是讨论、复盘或征求建议时，不要擅自修改计划。计划日期与截止日期是两个不同字段，日期使用 YYYY-MM-DD。',
+        ]
       : run.context.scope === 'articles'
         ? [`当前是文章来源“${run.context.sourceName}”的项目级持久化对话。`, `文章库目录：${run.context.cwd}`, '请从整个文章库范围理解任务。']
         : [
@@ -663,7 +729,7 @@ async function executeRun(run, session) {
 
 async function startChat(request, response) {
   const body = await readJson(request);
-  const context = resolveChatContext(body.scope, body.articlePath, body.sourceId);
+  const context = resolveChatContext(body.scope, body.articlePath, body.sourceId, body.contextId);
   const sessionId = positiveId(body.sessionId);
   if (!sessionId) return sendError(response, 400, '会话编号无效');
   let session = database.getSession(context.scope, context.key, sessionId);
@@ -691,7 +757,7 @@ async function startChat(request, response) {
 }
 
 async function reconnectChat(response, url) {
-  const context = resolveChatContext(url.searchParams.get('scope'), url.searchParams.get('article'), url.searchParams.get('source'));
+  const context = resolveChatContext(url.searchParams.get('scope'), url.searchParams.get('article'), url.searchParams.get('source'), url.searchParams.get('context'));
   const sessionId = positiveId(url.searchParams.get('session'));
   if (!sessionId || !database.getSession(context.scope, context.key, sessionId)) return sendError(response, 404, '会话不存在');
   const afterSeq = Math.max(0, Number(url.searchParams.get('after') || 0));
@@ -862,13 +928,13 @@ async function requestHandler(request, response) {
     return sendJson(response, 200, publicModelCatalog(catalog));
   }
   if (request.method === 'GET' && url.pathname === '/api/chat/sessions') {
-    const context = resolveChatContext(url.searchParams.get('scope'), url.searchParams.get('article'), url.searchParams.get('source'));
+    const context = resolveChatContext(url.searchParams.get('scope'), url.searchParams.get('article'), url.searchParams.get('source'), url.searchParams.get('context'));
     const sessions = await Promise.all(database.listSessions(context.scope, context.key).map(ensureConcreteSessionSettings));
     return sendJson(response, 200, { sessions: sessions.map(publicSession) });
   }
   if (request.method === 'POST' && url.pathname === '/api/chat/sessions') {
     const body = await readJson(request, 4096);
-    const context = resolveChatContext(body.scope, body.articlePath, body.sourceId);
+    const context = resolveChatContext(body.scope, body.articlePath, body.sourceId, body.contextId);
     const mode = String(body.mode || 'work');
     if (!['work', 'quick'].includes(mode)) return sendError(response, 400, '对话模式无效');
     if (mode === 'quick' && context.scope !== 'workspace') return sendError(response, 400, '快速问答只支持主对话界面');
@@ -888,7 +954,7 @@ async function requestHandler(request, response) {
   }
   if (request.method === 'PATCH' && url.pathname === '/api/chat/sessions') {
     const body = await readJson(request, 4096);
-    const context = resolveChatContext(body.scope, body.articlePath, body.sourceId);
+    const context = resolveChatContext(body.scope, body.articlePath, body.sourceId, body.contextId);
     const sessionId = positiveId(body.sessionId);
     const session = sessionId && database.getSession(context.scope, context.key, sessionId);
     if (!session) return sendError(response, 404, '会话不存在');
@@ -916,7 +982,7 @@ async function requestHandler(request, response) {
   }
   if (request.method === 'DELETE' && url.pathname === '/api/chat/sessions') {
     const body = await readJson(request, 4096);
-    const context = resolveChatContext(body.scope, body.articlePath, body.sourceId);
+    const context = resolveChatContext(body.scope, body.articlePath, body.sourceId, body.contextId);
     const sessionId = positiveId(body.sessionId);
     const session = sessionId && database.getSession(context.scope, context.key, sessionId);
     if (!session) return sendError(response, 404, '会话不存在');
@@ -930,7 +996,7 @@ async function requestHandler(request, response) {
     return sendJson(response, 200, { ok: true });
   }
   if (request.method === 'GET' && url.pathname === '/api/chat/history') {
-    const context = resolveChatContext(url.searchParams.get('scope'), url.searchParams.get('article'), url.searchParams.get('source'));
+    const context = resolveChatContext(url.searchParams.get('scope'), url.searchParams.get('article'), url.searchParams.get('source'), url.searchParams.get('context'));
     const sessionId = positiveId(url.searchParams.get('session'));
     const session = sessionId && database.getSession(context.scope, context.key, sessionId);
     if (!session) return sendError(response, 404, '会话不存在');
@@ -967,30 +1033,18 @@ async function requestHandler(request, response) {
     if (!id || !database.deleteQuickPhrase(id)) return sendError(response, 404, '快捷短语不存在');
     return sendJson(response, 200, { ok: true });
   }
-  if (request.method === 'GET' && url.pathname === '/api/planner/tasks') return sendJson(response, 200, { tasks: database.listTasks().map(publicTask) });
-  if (request.method === 'POST' && url.pathname === '/api/planner/tasks') {
-    const body = await readJson(request, 8192);
-    const title = String(body.title || '').trim();
-    if (!title || title.length > 240) return sendError(response, 400, '任务标题不能为空且不能超过 240 字');
-    const parentId = body.parentId == null ? null : positiveId(body.parentId);
-    if (body.parentId != null && !parentId) return sendError(response, 400, '父任务编号无效');
-    if (parentId && !database.getTask(parentId)) return sendError(response, 404, '父任务不存在');
-    return sendJson(response, 201, { task: publicTask(database.createTask({ ...body, title, parentId })) });
+  if (request.method === 'GET' && (url.pathname === '/api/planner' || url.pathname === '/api/planner/tasks')) {
+    return sendJson(response, 200, planner.snapshot());
   }
-  const taskMatch = url.pathname.match(/^\/api\/planner\/tasks\/(\d+)$/);
-  if (taskMatch && request.method === 'PATCH') {
-    const id = positiveId(taskMatch[1]);
-    const body = await readJson(request, 8192);
-    if (body.title !== undefined && !String(body.title).trim()) return sendError(response, 400, '任务标题不能为空');
-    if (body.status !== undefined && !['inbox', 'todo', 'doing', 'done'].includes(body.status)) return sendError(response, 400, '任务状态无效');
-    if (body.priority !== undefined && !['low', 'medium', 'high'].includes(body.priority)) return sendError(response, 400, '优先级无效');
-    const task = database.updateTask(id, { ...body, ...(body.title !== undefined ? { title: String(body.title).trim() } : {}) });
-    if (!task) return sendError(response, 404, '任务不存在');
-    return sendJson(response, 200, { task: publicTask(task) });
-  }
-  if (taskMatch && request.method === 'DELETE') {
-    if (!database.deleteTask(positiveId(taskMatch[1]))) return sendError(response, 404, '任务不存在');
-    return sendJson(response, 200, { ok: true });
+  const taskActionMatch = url.pathname.match(/^\/api\/planner\/tasks\/(\d+)\/action$/);
+  if (taskActionMatch && request.method === 'POST') {
+    const body = await readJson(request, 4096);
+    try {
+      const task = planner.actOnTask(taskActionMatch[1], body.action);
+      return sendJson(response, 200, { task });
+    } catch (error) {
+      return sendError(response, 400, error instanceof Error ? error.message : '任务操作失败');
+    }
   }
   if (request.method === 'GET' && url.pathname.startsWith('/content/')) {
     const requestedPath = decodeURIComponent(url.pathname.slice('/content/'.length));

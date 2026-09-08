@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { CodexAppServerClient } from '../server/codex-client.js';
 import { ContentRepository, renderMarkdown } from '../server/content.js';
 import { WorkbenchDatabase } from '../server/db.js';
+import { nextRecurrenceDate, PlannerService, plannerCalendar } from '../server/planner.js';
 import { normalizeCodeLanguage, withCodeLineMarkup } from '../lib/code-highlight.js';
 import { codeTextFromRenderedLines } from '../lib/code-copy.js';
 import { normalizeMathDelimiters } from '../lib/markdown-math.js';
@@ -137,17 +138,222 @@ test('planner tasks support persisted parent-child relationships', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mainworker-planner-test-'));
   const database = new WorkbenchDatabase(directory);
   try {
-    const parent = database.createTask({ title: '学习方向', status: 'todo', priority: 'high' });
-    const child = database.createTask({ title: '第一阶段', parentId: Number(parent.id), status: 'todo', priority: 'medium' });
+    const project = database.createProject({ title: '算法项目', status: 'active' });
+    const parent = database.createTask({ projectId: Number(project.id), title: '学习算法', status: 'todo', priority: 'high', position: 20 });
+    const child = database.createTask({ projectId: Number(project.id), title: '第一阶段', parentId: Number(parent.id), status: 'todo', priority: 'medium' });
+    const earlier = database.createTask({ projectId: Number(project.id), title: '优先任务', status: 'todo', priority: 'medium', position: 2 });
 
     assert.equal(Number(child.parent_id), Number(parent.id));
-    assert.equal(database.listTasks().length, 2);
+    assert.equal(Number(child.project_id), Number(project.id));
+    assert.deepEqual(database.listProjectTasks(Number(project.id)).filter((task) => !task.parent_id).map((task) => task.title), ['优先任务', '学习算法']);
+    assert.equal(database.listTasks().length, 3);
     assert.equal(database.deleteTask(Number(parent.id)), true);
-    assert.equal(database.listTasks().length, 0);
+    assert.deepEqual(database.listTasks().map((task) => Number(task.id)), [Number(earlier.id)]);
+    assert.equal(database.listProjects().length, 1);
   } finally {
     database.database.close();
     fs.rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test('legacy planner directions migrate losslessly into projects and planned tasks', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mainworker-planner-migration-test-'));
+  const file = path.join(directory, 'mainworker.sqlite');
+  const legacy = new DatabaseSync(file);
+  legacy.exec(`
+    CREATE TABLE planner_tasks (
+      id INTEGER PRIMARY KEY,
+      title TEXT NOT NULL,
+      notes TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'todo' CHECK(status IN ('inbox','todo','doing','done')),
+      priority TEXT NOT NULL DEFAULT 'medium' CHECK(priority IN ('low','medium','high')),
+      due_date TEXT,
+      project TEXT NOT NULL DEFAULT '',
+      parent_id INTEGER REFERENCES planner_tasks(id) ON DELETE CASCADE,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    INSERT INTO planner_tasks(id, title, notes, status, priority, due_date, parent_id)
+      VALUES (7, '长期学习', '保留说明', 'doing', 'high', NULL, NULL);
+    INSERT INTO planner_tasks(id, title, notes, status, priority, due_date, parent_id)
+      VALUES (9, '完成第一章', '旧任务', 'done', 'medium', '2026-09-09', 7);
+  `);
+  legacy.close();
+
+  const database = new WorkbenchDatabase(directory);
+  try {
+    const projects = database.listProjects();
+    const tasks = database.listTasks();
+    assert.equal(projects.length, 1);
+    assert.deepEqual({ id: Number(projects[0].id), title: projects[0].title, notes: projects[0].notes, status: projects[0].status }, {
+      id: 7, title: '长期学习', notes: '保留说明', status: 'active',
+    });
+    assert.equal(tasks.length, 1);
+    assert.deepEqual({ id: Number(tasks[0].id), projectId: Number(tasks[0].project_id), status: tasks[0].status, plannedDate: tasks[0].planned_date, deadlineDate: tasks[0].deadline_date }, {
+      id: 9, projectId: 7, status: 'done', plannedDate: '2026-09-09', deadlineDate: null,
+    });
+    assert.equal(database.database.prepare("SELECT COUNT(*) AS count FROM sqlite_schema WHERE type = 'table' AND name = 'planner_tasks_legacy'").get().count, 0);
+  } finally {
+    database.database.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('recurring tasks keep one open occurrence and preserve immutable history', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mainworker-planner-recurrence-test-'));
+  const database = new WorkbenchDatabase(directory);
+  const planner = new PlannerService(database);
+  try {
+    const today = plannerCalendar().today;
+    const project = planner.execute({ operation: 'create_project', title: '每日复盘' }).project;
+    const recurrence = planner.execute({
+      operation: 'create_recurring_task', projectId: project.id, title: '整理当天记录',
+      frequency: 'daily', startDate: today, subtasks: [{ title: '写三条结论' }],
+    }).recurrence;
+    let snapshot = planner.snapshot();
+    let roots = snapshot.tasks.filter((task) => task.recurrenceId === recurrence.id);
+    assert.equal(roots.filter((task) => ['todo', 'doing'].includes(task.status)).length, 1);
+    const first = roots[0];
+    const firstChild = snapshot.tasks.find((task) => task.parentId === first.id);
+    assert.ok(firstChild);
+    assert.throws(() => planner.actOnTask(first.id, 'complete'), /未完成的子任务/);
+
+    planner.execute({
+      operation: 'update_recurring_task', id: recurrence.id, title: '整理并归档记录',
+      subtasks: [{ title: '写四条结论', priority: 'high' }],
+    });
+    snapshot = planner.snapshot();
+    assert.equal(snapshot.tasks.find((task) => task.id === first.id).title, '整理当天记录');
+    assert.equal(snapshot.tasks.find((task) => task.id === firstChild.id).title, '写三条结论');
+
+    planner.actOnTask(firstChild.id, 'complete');
+    planner.actOnTask(first.id, 'complete');
+    snapshot = planner.snapshot();
+    roots = snapshot.tasks.filter((task) => task.recurrenceId === recurrence.id);
+    assert.equal(roots.filter((task) => ['todo', 'doing'].includes(task.status)).length, 1);
+    assert.equal(roots.filter((task) => task.status === 'done').length, 1);
+    const second = roots.find((task) => task.status === 'todo');
+    assert.ok(second.occurrenceDate > first.occurrenceDate);
+    assert.equal(second.title, '整理并归档记录');
+    assert.equal(snapshot.tasks.find((task) => task.parentId === second.id)?.title, '写四条结论');
+    assert.throws(() => planner.execute({ operation: 'update_task', id: first.id, title: '覆盖历史' }), /历史实例不可修改/);
+
+    planner.actOnTask(second.id, 'skip');
+    snapshot = planner.snapshot();
+    roots = snapshot.tasks.filter((task) => task.recurrenceId === recurrence.id);
+    assert.equal(roots.filter((task) => ['todo', 'doing'].includes(task.status)).length, 1);
+    assert.equal(roots.filter((task) => task.status === 'skipped').length, 1);
+    assert.ok(roots.find((task) => task.status === 'todo').occurrenceDate > second.occurrenceDate);
+    assert.throws(() => database.insertRecurrenceOccurrence(recurrence.id, '2099-01-01'));
+    assert.throws(() => planner.execute({ operation: 'update_project', id: project.id, projectStatus: 'completed' }), /未结束的循环任务/);
+  } finally {
+    database.database.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('recurrence calendars honor workdays, selected weekdays, and end dates', () => {
+  assert.equal(nextRecurrenceDate({
+    frequency: 'workdays', weekdays: [], start_date: '2026-09-01', end_date: null,
+  }, '2026-09-11'), '2026-09-14');
+  assert.equal(nextRecurrenceDate({
+    frequency: 'weekly', weekdays: [2, 4], start_date: '2026-09-01', end_date: null,
+  }, '2026-09-08'), '2026-09-10');
+  assert.equal(nextRecurrenceDate({
+    frequency: 'weekly', weekdays: [2], start_date: '2026-09-01', end_date: '2026-09-08',
+  }, '2026-09-08'), null);
+});
+
+test('a finite recurrence ends automatically after its final occurrence is resolved', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mainworker-planner-finite-recurrence-test-'));
+  const database = new WorkbenchDatabase(directory);
+  const planner = new PlannerService(database);
+  try {
+    const today = plannerCalendar().today;
+    const project = planner.execute({ operation: 'create_project', title: '短期计划' }).project;
+    const recurrence = planner.execute({
+      operation: 'create_recurring_task', projectId: project.id, title: '最后一次',
+      frequency: 'daily', startDate: today, endDate: today,
+    }).recurrence;
+    planner.execute({ operation: 'pause_recurring_task', id: recurrence.id });
+    planner.actOnTask(recurrence.currentTaskId, 'complete');
+    const snapshot = planner.snapshot();
+    assert.equal(snapshot.recurrences.find((item) => item.id === recurrence.id).state, 'ended');
+    assert.equal(snapshot.recurrences.find((item) => item.id === recurrence.id).currentTaskId, null);
+    assert.equal(snapshot.tasks.filter((task) => task.recurrenceId === recurrence.id && ['todo', 'doing'].includes(task.status)).length, 0);
+  } finally {
+    database.database.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('resuming after an early paused completion advances beyond the historical occurrence', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mainworker-planner-resume-test-'));
+  const database = new WorkbenchDatabase(directory);
+  const planner = new PlannerService(database);
+  try {
+    const today = plannerCalendar().today;
+    const tomorrowValue = new Date(`${today}T00:00:00Z`);
+    tomorrowValue.setUTCDate(tomorrowValue.getUTCDate() + 1);
+    const tomorrow = tomorrowValue.toISOString().slice(0, 10);
+    const project = planner.execute({ operation: 'create_project', title: '恢复测试' }).project;
+    const recurrence = planner.execute({
+      operation: 'create_recurring_task', projectId: project.id, title: '未来实例',
+      frequency: 'daily', startDate: tomorrow,
+    }).recurrence;
+    planner.execute({ operation: 'pause_recurring_task', id: recurrence.id });
+    planner.actOnTask(recurrence.currentTaskId, 'complete');
+    assert.equal(planner.snapshot().recurrences.find((item) => item.id === recurrence.id).currentTaskId, null);
+
+    const resumed = planner.execute({ operation: 'resume_recurring_task', id: recurrence.id }).recurrence;
+    const current = planner.snapshot().tasks.find((task) => task.id === resumed.currentTaskId);
+    assert.ok(current.occurrenceDate > tomorrow);
+    assert.equal(planner.snapshot().tasks.filter((task) => task.recurrenceId === recurrence.id && ['todo', 'doing'].includes(task.status)).length, 1);
+  } finally {
+    database.database.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('planner conversations use a scoped AI tool while the interface stays execution-only', async () => {
+  const client = new CodexAppServerClient();
+  const context = { cwd: projectRoot, scope: 'planner', readOnly: true };
+  const options = client.threadOptions(context, { mode: 'work' });
+  assert.equal(options.sandbox, 'read-only');
+  assert.equal(options.dynamicTools.length, 1);
+  assert.equal(options.dynamicTools[0].name, 'manage_personal_plan');
+  assert.deepEqual(options.dynamicTools[0].inputSchema.properties.operation.enum, [
+    'create_project', 'update_project', 'delete_project',
+    'create_task', 'update_task', 'delete_task', 'act_on_task',
+    'create_recurring_task', 'update_recurring_task', 'pause_recurring_task',
+    'resume_recurring_task', 'end_recurring_task', 'delete_recurring_task',
+  ]);
+
+  const calls = [];
+  client.request = async (method, params) => {
+    calls.push({ method, params });
+    if (method === 'thread/resume') return { thread: { id: 'thread-planner' } };
+    return { turn: { id: 'turn-planner' } };
+  };
+  await client.startTurn('thread-planner', '帮我拆解这个项目', context, { mode: 'work' });
+  const resume = calls.find((call) => call.method === 'thread/resume').params;
+  assert.equal(resume.dynamicTools, undefined);
+  assert.equal(resume.ephemeral, undefined);
+  assert.equal(resume.serviceName, undefined);
+  assert.equal(resume.sandbox, 'read-only');
+  assert.deepEqual(calls.find((call) => call.method === 'turn/start').params.sandboxPolicy, { type: 'readOnly', networkAccess: false });
+
+  const planner = fs.readFileSync(path.join(projectRoot, 'components/planner-module.tsx'), 'utf8');
+  assert.match(planner, /<ChatWorkspace compact scope="planner" contextId="all"/);
+  assert.match(planner, /onRunComplete=\{\(\) => void load\(\)\}/);
+  assert.doesNotMatch(planner, /Dialog|openEditor|deleteDirection|newActionTitle/);
+  assert.doesNotMatch(planner, /<input|<textarea|新建项目|新建任务/);
+  const design = fs.readFileSync(path.join(projectRoot, 'docs/planner-design.md'), 'utf8');
+  assert.match(design, /代码与本文档冲突时，以本文档为准/);
+  assert.match(design, /项目[\s\S]*任务[\s\S]*子任务/);
+  const chatHook = fs.readFileSync(path.join(projectRoot, 'hooks/use-chat.ts'), 'utf8');
+  assert.match(chatHook, /const legacyKey = `\$\{prefix\}:\$\{context\.scope\}:\$\{context\.sourceId \|\| ''\}:\$\{context\.articlePath \|\| ''\}`/);
+  assert.match(chatHook, /context\.contextId \? `\$\{legacyKey\}:\$\{context\.contextId\}` : legacyKey/);
 });
 
 test('article revisions are stored per turn and can be marked safely reverted', () => {

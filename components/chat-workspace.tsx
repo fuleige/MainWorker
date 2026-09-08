@@ -44,9 +44,10 @@ const effortLabels: Record<string, string> = {
 };
 
 type ChatWorkspaceProps = {
-  scope: 'workspace' | 'articles' | 'article';
+  scope: 'workspace' | 'articles' | 'article' | 'planner';
   articlePath?: string | null;
   sourceId?: string | null;
+  contextId?: string | null;
   title: string;
   subtitle: string;
   compact?: boolean;
@@ -227,7 +228,7 @@ export function ChatWorkspace(props: ChatWorkspaceProps) {
   const { onBusyChange, promptRequest } = props;
   const sendChat = chat.send;
   const [draft, setDraft] = useState('');
-  const draftStorageKey = `mainworker:composer-draft:${props.scope}:${props.sourceId || ''}:${props.articlePath || ''}`;
+  const draftStorageKey = `mainworker:composer-draft:${props.scope}:${props.sourceId || ''}:${props.articlePath || ''}${props.contextId ? `:${props.contextId}` : ''}`;
   const draftRef = useRef('');
   const [deletingId, setDeletingId] = useState<number | null>(null);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
@@ -443,7 +444,7 @@ export function ChatWorkspace(props: ChatWorkspaceProps) {
               <NativeSelect value={chat.currentSession?.id || ''} onChange={(event) => { const item = chat.sessions.find((session) => session.id === Number(event.target.value)); if (item) void chat.selectSession(item); }} aria-label="选择会话">
                 {chat.sessions.map((session) => <NativeSelectOption key={session.id} value={session.id}>{session.title}</NativeSelectOption>)}
               </NativeSelect>
-              <Button variant="ghost" size="icon-sm" onClick={() => startNewSession()} aria-label="新建审核会话" title="新建会话"><Plus /></Button>
+              <Button variant="ghost" size="icon-sm" onClick={() => startNewSession()} aria-label="新建会话" title="新建会话"><Plus /></Button>
               <Button variant="ghost" size="icon-sm" disabled={!chat.currentSession || chat.currentSession.running || deletingId === chat.currentSession.id} onClick={() => { if (chat.currentSession) void removeSession(chat.currentSession); }} aria-label="删除当前审核会话" title="删除当前会话"><Trash2 /></Button>
             </div>
           ) : <span className={`connection-state ${chat.sending ? 'is-working' : ''}`}><i />{chat.sending ? chat.activity : '就绪'}</span>}
@@ -458,7 +459,7 @@ export function ChatWorkspace(props: ChatWorkspaceProps) {
                 <div className="chat-empty is-missing-session"><span><MessageSquareText /></span><h3>会话不可用</h3><p>会话 {chat.missingSessionId} 不存在或已经被删除。地址没有被改成新会话，以免掩盖问题。</p><Button variant="outline" onClick={() => startNewSession()}><Plus />打开新对话</Button></div>
               ) : null}
               {!chat.loading && !chat.missingSessionId && !chat.messages.length ? (
-                <div className={`chat-empty ${quickMode ? 'is-quick' : ''}`}><span>{quickMode ? <Globe2 /> : <MessageSquareText />}</span><h3>{newSession ? '新会话' : quickMode ? '直接问我' : '从这里开始'}</h3><p>{quickMode ? '适合简单问题；需要最新信息时会自动联网搜索。' : props.scope === 'article' ? '让 Codex 审核、改写或直接修改当前文章。' : props.scope === 'articles' ? '从整个文章库范围整理、检查和规划内容。' : '选择模式后直接输入；发送第一条消息时才会保存这个会话。'}</p></div>
+                <div className={`chat-empty ${quickMode ? 'is-quick' : ''}`}><span>{quickMode ? <Globe2 /> : <MessageSquareText />}</span><h3>{newSession ? '新会话' : quickMode ? '直接问我' : '从这里开始'}</h3><p>{quickMode ? '适合简单问题；需要最新信息时会自动联网搜索。' : props.scope === 'article' ? '让 Codex 审核、改写或直接修改当前文章。' : props.scope === 'articles' ? '从整个文章库范围整理、检查和规划内容。' : props.scope === 'planner' ? '告诉我你的目标、约束或进展，我会直接维护项目、任务与循环计划。' : '选择模式后直接输入；发送第一条消息时才会保存这个会话。'}</p></div>
               ) : null}
               {chat.messages.map((message) => (
                 <article className={`message ${message.role === 'user' ? 'user-message' : 'agent-message'} ${message.status === 'failed' ? 'is-error' : ''}`} key={message.id}>

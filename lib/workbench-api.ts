@@ -20,10 +20,11 @@ export async function api<T>(url: string, options: RequestInit = {}): Promise<T>
   return response.json() as Promise<T>;
 }
 
-export function chatQuery(scope: string, articlePath?: string | null, sourceId?: string | null) {
+export function chatQuery(scope: string, articlePath?: string | null, sourceId?: string | null, contextId?: string | null) {
   const params = new URLSearchParams({ scope });
   if (articlePath) params.set('article', articlePath);
   if (sourceId) params.set('source', sourceId);
+  if (contextId) params.set('context', contextId);
   return params;
 }
 

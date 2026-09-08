@@ -32,7 +32,7 @@ export const workbenchTools = [
   {
     id: 'planner',
     title: '规划',
-    description: '整理长期方向、今日事项和层级任务。',
+    description: '管理项目、今日事项和循环任务。',
     href: '/tools/planner',
     documentTitle: '个人规划 · MainWorker',
     legacyModule: 'planner',

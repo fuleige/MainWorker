@@ -69,9 +69,10 @@ type ActiveRun = {
 };
 
 type UseChatOptions = {
-  scope: 'workspace' | 'articles' | 'article';
+  scope: 'workspace' | 'articles' | 'article' | 'planner';
   articlePath?: string | null;
   sourceId?: string | null;
+  contextId?: string | null;
   enabled?: boolean;
   onUnauthorized?: () => void;
   sessionId?: number | null;
@@ -93,7 +94,12 @@ function eventText(value: unknown, fallback = '') {
   return typeof value === 'string' || typeof value === 'number' ? String(value) : fallback;
 }
 
-export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauthorized, sessionId: requestedSessionId = null, onSessionUrlChange, onRunComplete }: UseChatOptions) {
+function chatStorageKey(prefix: string, context: { scope: string; sourceId?: string | null; articlePath?: string | null; contextId?: string | null }) {
+  const legacyKey = `${prefix}:${context.scope}:${context.sourceId || ''}:${context.articlePath || ''}`;
+  return context.contextId ? `${legacyKey}:${context.contextId}` : legacyKey;
+}
+
+export function useChat({ scope, articlePath, sourceId, contextId, enabled = true, onUnauthorized, sessionId: requestedSessionId = null, onSessionUrlChange, onRunComplete }: UseChatOptions) {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [currentSession, setCurrentSession] = useState<ChatSession | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -116,7 +122,7 @@ export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauth
   const initializedKey = useRef('');
   const activeRef = useRef<ActiveRun | null>(null);
   const controllerRef = useRef<AbortController | null>(null);
-  const scopeRef = useRef({ scope, articlePath, sourceId });
+  const scopeRef = useRef({ scope, articlePath, sourceId, contextId });
   const draftModeRef = useRef<ChatMode>('work');
   const onRunCompleteRef = useRef(onRunComplete);
 
@@ -125,8 +131,8 @@ export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauth
   }, [onRunComplete]);
 
   useEffect(() => {
-    scopeRef.current = { scope, articlePath, sourceId };
-  }, [articlePath, scope, sourceId]);
+    scopeRef.current = { scope, articlePath, sourceId, contextId };
+  }, [articlePath, contextId, scope, sourceId]);
 
   useEffect(() => {
     if (!enabled || scope !== 'workspace') return;
@@ -234,7 +240,7 @@ export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauth
       while (activeRef.current && !controller.signal.aborted) {
         const current = activeRef.current;
         const context = scopeRef.current;
-        const params = chatQuery(context.scope, context.articlePath, context.sourceId);
+        const params = chatQuery(context.scope, context.articlePath, context.sourceId, context.contextId);
         params.set('session', String(sessionId));
         params.set('runId', current.runId);
         params.set('turnId', current.turnId || '');
@@ -259,7 +265,7 @@ export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauth
     setSending(false);
     setError('');
     const context = scopeRef.current;
-    const params = chatQuery(context.scope, context.articlePath, context.sourceId);
+    const params = chatQuery(context.scope, context.articlePath, context.sourceId, context.contextId);
     params.set('session', String(session.id));
     const payload = await api<{ turns: StoredTurn[]; activeRun: ActiveRun | null }>(`/api/chat/history?${params}`);
     const restored: ChatMessage[] = [];
@@ -294,12 +300,12 @@ export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauth
 
   const refreshSessions = useCallback(async (preferredId?: number | null) => {
     const context = scopeRef.current;
-    const params = chatQuery(context.scope, context.articlePath, context.sourceId);
+    const params = chatQuery(context.scope, context.articlePath, context.sourceId, context.contextId);
     let payload = await api<{ sessions: ChatSession[] }>(`/api/chat/sessions?${params}`);
     if (!payload.sessions.length && context.scope !== 'workspace') {
       const created = await api<{ session: ChatSession }>('/api/chat/sessions', {
         method: 'POST',
-        body: JSON.stringify({ scope: context.scope, articlePath: context.articlePath, sourceId: context.sourceId }),
+        body: JSON.stringify({ scope: context.scope, articlePath: context.articlePath, sourceId: context.sourceId, contextId: context.contextId }),
       });
       payload = { sessions: [created.session] };
     }
@@ -310,7 +316,7 @@ export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauth
       setMissingSessionId(null);
       return;
     }
-    const storageKey = `mainworker:session:${context.scope}:${context.sourceId || ''}:${context.articlePath || ''}`;
+    const storageKey = chatStorageKey('mainworker:session', context);
     const savedId = Number(localStorage.getItem(storageKey));
     const selected = payload.sessions.find((item) => item.id === preferredId)
       || (context.scope === 'workspace' ? undefined : payload.sessions.find((item) => item.id === savedId))
@@ -328,7 +334,7 @@ export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauth
   }, [loadHistory]);
 
   useEffect(() => {
-    const key = `${scope}:${sourceId || ''}:${articlePath || ''}:${enabled}:${scope === 'workspace' ? requestedSessionId ?? 'new' : 'context'}`;
+    const key = `${scope}:${sourceId || ''}:${articlePath || ''}:${contextId || ''}:${enabled}:${scope === 'workspace' ? requestedSessionId ?? 'new' : 'context'}`;
     if (!enabled || initializedKey.current === key) return;
     initializedKey.current = key;
     setLoading(true);
@@ -336,13 +342,13 @@ export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauth
     setMessages([]);
     void refreshSessions(scope === 'workspace' ? requestedSessionId : undefined).catch(handleError).finally(() => setLoading(false));
     return () => controllerRef.current?.abort();
-  }, [articlePath, enabled, handleError, refreshSessions, requestedSessionId, scope, sourceId]);
+  }, [articlePath, contextId, enabled, handleError, refreshSessions, requestedSessionId, scope, sourceId]);
 
   const selectSession = useCallback(async (session: ChatSession) => {
     setCurrentSession(session);
     setMissingSessionId(null);
     const context = scopeRef.current;
-    localStorage.setItem(`mainworker:session:${context.scope}:${context.sourceId || ''}:${context.articlePath || ''}`, String(session.id));
+    localStorage.setItem(chatStorageKey('mainworker:session', context), String(session.id));
     setLoading(true);
     try {
       await loadHistory(session);
@@ -376,7 +382,7 @@ export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauth
     }
     try {
       const payload = await api<{ session: ChatSession }>('/api/chat/sessions', {
-        method: 'POST', body: JSON.stringify({ scope: context.scope, articlePath: context.articlePath, sourceId: context.sourceId, mode }),
+        method: 'POST', body: JSON.stringify({ scope: context.scope, articlePath: context.articlePath, sourceId: context.sourceId, contextId: context.contextId, mode }),
       });
       setSessions((items) => [payload.session, ...items]);
       await selectSession(payload.session);
@@ -390,7 +396,7 @@ export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauth
     if (!session || session.running) return;
     try {
       const context = scopeRef.current;
-      await api('/api/chat/sessions', { method: 'DELETE', body: JSON.stringify({ scope: context.scope, articlePath: context.articlePath, sourceId: context.sourceId, sessionId: session.id }) });
+      await api('/api/chat/sessions', { method: 'DELETE', body: JSON.stringify({ scope: context.scope, articlePath: context.articlePath, sourceId: context.sourceId, contextId: context.contextId, sessionId: session.id }) });
       const deletingCurrent = currentSession?.id === session.id;
       if (deletingCurrent) {
         setCurrentSession(null);
@@ -422,6 +428,7 @@ export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauth
           scope: context.scope,
           articlePath: context.articlePath,
           sourceId: context.sourceId,
+          contextId: context.contextId,
           sessionId: currentSession.id,
           model,
           reasoningEffort,
@@ -455,6 +462,7 @@ export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauth
             scope: context.scope,
             articlePath: context.articlePath,
             sourceId: context.sourceId,
+            contextId: context.contextId,
             mode: draftMode,
             model: draftModel,
             reasoningEffort: draftReasoningEffort,
@@ -465,13 +473,13 @@ export function useChat({ scope, articlePath, sourceId, enabled = true, onUnauth
         setCurrentSession(createdSession);
         setMissingSessionId(null);
         setSessions((items) => [createdSession, ...items]);
-        localStorage.setItem(`mainworker:session:${context.scope}:${context.sourceId || ''}:${context.articlePath || ''}`, String(createdSession.id));
+        localStorage.setItem(chatStorageKey('mainworker:session', context), String(createdSession.id));
         if (context.scope === 'workspace') onSessionUrlChange?.(createdSession.id, 'replace');
       }
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ scope: context.scope, articlePath: context.articlePath, sourceId: context.sourceId, sessionId: session.id, message: text.trim() }),
+        body: JSON.stringify({ scope: context.scope, articlePath: context.articlePath, sourceId: context.sourceId, contextId: context.contextId, sessionId: session.id, message: text.trim() }),
       });
       await follow(response, assistantId, session.id);
       await refreshSessions(session.id);
