@@ -813,6 +813,9 @@ test('the quota module is reachable from desktop and mobile navigation without p
   assert.match(limits, /const available = clampPercent\(100 - used\)/);
   assert.match(limits, /if \(minutes === 7 \* 1440\) return '周额度';/);
   assert.match(limits, /return `\$\{minutes \/ 60\} 小时额度`/);
+  assert.match(limits, /remainingMs \/ 86_400_000\)\.toFixed\(1\)/);
+  assert.match(limits, /className="limit-reset-days">\{resetCountdown\.days\} 天<\/strong>/);
+  assert.match(css, /\.limit-reset-days\s*\{[^}]*color:\s*#d04a3a;[^}]*font-size:\s*13px;[^}]*font-weight:\s*800;/s);
   assert.match(limits, /fallbackTitle="短期额度"/);
   assert.match(limits, /fallbackTitle="长期额度"/);
   assert.doesNotMatch(limits, /主要额度|补充额度/);

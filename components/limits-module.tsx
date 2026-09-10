@@ -139,12 +139,15 @@ function expiryDateTimeAttribute(value: number | null) {
 }
 
 function untilReset(timestamp: number | null) {
-  if (!timestamp) return '重置时间未知';
-  const minutes = Math.max(0, Math.ceil((timestamp * 1000 - Date.now()) / 60_000));
-  if (minutes <= 0) return '等待额度状态更新';
-  if (minutes >= 1440) return `约 ${Math.ceil(minutes / 1440)} 天后重置`;
-  if (minutes >= 60) return `约 ${Math.ceil(minutes / 60)} 小时后重置`;
-  return `约 ${minutes} 分钟后重置`;
+  if (!timestamp) return { label: '重置时间未知', days: null };
+  const remainingMs = Math.max(0, timestamp * 1000 - Date.now());
+  if (remainingMs <= 0) return { label: '等待额度状态更新', days: null };
+  if (remainingMs >= 86_400_000) {
+    return { label: '', days: (remainingMs / 86_400_000).toFixed(1) };
+  }
+  const minutes = Math.ceil(remainingMs / 60_000);
+  if (minutes >= 60) return { label: `约 ${Math.ceil(minutes / 60)} 小时后重置`, days: null };
+  return { label: `约 ${minutes} 分钟后重置`, days: null };
 }
 
 function WindowUsage({ fallbackTitle, window }: { fallbackTitle: string; window: LimitWindow }) {
@@ -152,6 +155,7 @@ function WindowUsage({ fallbackTitle, window }: { fallbackTitle: string; window:
   const available = clampPercent(100 - used);
   const tone = available <= 10 ? 'critical' : available <= 30 ? 'warning' : 'normal';
   const title = quotaWindowLabel(window.windowDurationMins, fallbackTitle);
+  const resetCountdown = untilReset(window.resetsAt);
   return (
     <div className={`limit-window ${tone}`}>
       <div className="limit-window-heading">
@@ -161,7 +165,7 @@ function WindowUsage({ fallbackTitle, window }: { fallbackTitle: string; window:
       <div className="limit-progress" aria-hidden="true">
         <span className="limit-progress-fill" style={{ width: `${available}%` }} />
       </div>
-      <div className="limit-reset"><Clock3 /><span>{untilReset(window.resetsAt)} · {dateTime(window.resetsAt)}</span></div>
+      <div className="limit-reset"><Clock3 /><span>{resetCountdown.days ? <>约 <strong className="limit-reset-days">{resetCountdown.days} 天</strong>后重置</> : resetCountdown.label} · {dateTime(window.resetsAt)}</span></div>
     </div>
   );
 }
